@@ -1,0 +1,87 @@
+[workflow]
+active_mlp = "mattersim"          # mattersim, mace_mp, or sevennet
+run_dir = "runs/{mlp}"
+input_poscar = "POSCAR"
+overwrite_next_inputs = true     # keep manually supplied files in each INPUT dir
+
+[execution]
+auto_relaunch = true              # relaunch each stage into the configured conda env
+phonopy_conda_env = ""            # empty means use the selected MLP env
+
+[execution.extra_env]
+MPLCONFIGDIR = "{run_dir}/.matplotlib"
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
+
+[mlp.mattersim]
+calculator = "mattersim"
+conda_env = "mattersim_env"
+
+[mlp.mattersim.kwargs]
+device = "cpu"
+compute_stress = true
+load_path = "MatterSim-v1.0.0-5M"
+model_name = "m3gnet"
+
+[mlp.mace_mp]
+calculator = "mace_mp"
+conda_env = "mace_env"
+
+[mlp.mace_mp.kwargs]
+model = "medium"                  # or a local checkpoint path
+device = "cpu"
+default_dtype = "float64"
+dispersion = false
+
+[mlp.sevennet]
+calculator = "sevennet"
+conda_env = "sevenn_env"
+
+[mlp.sevennet.kwargs]
+model = "7net-omni"                  # or a local checkpoint path
+device = "auto"
+modal = "mpa"
+
+[relax]
+optimizer = "LBFGS"               # LBFGS, BFGS, or FIRE
+fmax = 0.001
+max_steps = 500
+write_extxyz = true
+
+[phonopy]
+calculator = "vasp"
+supercell_matrix = [2, 2, 2]
+primitive_matrix = "auto"
+symprec = 1.0e-5
+is_symmetry = true
+use_SNF_supercell = false
+
+[displacements]
+distance = 0.03
+is_plusminus = "auto"
+is_diagonal = true
+is_trigonal = false
+zfill_width = 3
+supercell_filename_prefix = "POSCAR"
+
+[forces]
+subtract_drift = true
+write_npz = true
+
+[band]
+auto = false                       # true: use phonopy auto band path
+nqpoints = 101
+with_eigenvectors = false
+with_group_velocities = false
+is_band_connection = false
+fc_calculator = "traditional"     # traditional, symfc, or alm if installed
+fc_calculator_options = ""
+write_force_constants = false
+force_constants_format = "hdf5"   # hdf5 or text
+paths = [
+    [[0.0,   0.0,   0.0],   [0.5,   0.0,   0.5]],   # G -> X
+    [[0.5,   0.0,   0.5],   [0.375, 0.375, 0.75]],  # X -> K, W 생략
+    [[0.375, 0.375, 0.75],  [0.0,   0.0,   0.0]],   # K -> G
+    [[0.0,   0.0,   0.0],   [0.5,   0.5,   0.5]],   # G -> L
+]
+
+labels = ["G", "X", "K", "G", "L"]
