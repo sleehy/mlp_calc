@@ -27,7 +27,7 @@ calculator = "mace_mp"
 conda_env = "mace_env"
 
 [mlp.mace_mp.kwargs]
-model = "medium"                  # or a local checkpoint path
+model = "medium-omat-0"                # or a local checkpoint path
 device = "cpu"
 default_dtype = "float64"
 dispersion = false
@@ -42,7 +42,7 @@ device = "auto"
 modal = "mpa"
 
 [relax]
-optimizer = "LBFGS"               # LBFGS, BFGS, or FIRE
+optimizer = "BFGS"               # LBFGS, BFGS, or FIRE
 fmax = 0.001
 max_steps = 500
 write_extxyz = true
@@ -79,7 +79,7 @@ write_force_constants = false
 force_constants_format = "hdf5"   # hdf5 or text
 paths = [
     [[0.0,   0.0,   0.0],   [0.5,   0.0,   0.5]],   # G -> X
-    [[0.5,   0.0,   0.5],   [0.375, 0.375, 0.75]],  # X -> K, W 생략
+    [[0.5,   0.0,   0.5],   [0.375, 0.375, 0.75]],  # X -> K
     [[0.375, 0.375, 0.75],  [0.0,   0.0,   0.0]],   # K -> G
     [[0.0,   0.0,   0.0],   [0.5,   0.5,   0.5]],   # G -> L
 ]

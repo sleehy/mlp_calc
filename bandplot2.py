@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # -------------------------
 band_yaml_path = "runs/mattersim/04_band/OUTPUT/band.yaml"
 experiment_csv_path = "experiment_points.csv"
-output_png_path = "band_plot_mattersim.png"
+output_png_path = "band_plot_mattersim_new_relax.png"
 
 
 # -------------------------
