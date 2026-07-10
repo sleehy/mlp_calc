@@ -8,21 +8,27 @@ import sys
 from pathlib import Path
 
 from .config import ConfigError, conda_env_for_stage, extra_env, load_config, run_dir
-from .stages import STAGES, run_stage, stage_status
+from .stages import PHONOPY_STAGES, STAGES, run_stage, stage_status
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mlp-phonon-workflow",
-        description="Resumable POSCAR -> MLP relax -> phonopy -> FORCE_SETS -> band.yaml workflow.",
+        description=(
+            "Resumable MLP workflow for phonopy bands and phono3py thermal "
+            "conductivity."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Run one stage or all stages.")
     run_parser.add_argument(
         "stage",
-        choices=[*STAGES, "all"],
-        help="Stage to run. Use 'all' to run relax, displace, forces, band.",
+        choices=[*STAGES, "all", "phono3py-all"],
+        help=(
+            "Stage to run. 'all' keeps the original phonopy chain; "
+            "'phono3py-all' runs relaxation through configured conductivity methods."
+        ),
     )
     _add_common_args(run_parser)
     run_parser.add_argument("--force", action="store_true", help="Rerun even if output exists.")
@@ -44,7 +50,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_status(config)
             return 0
 
-        stages = STAGES if args.stage == "all" else (args.stage,)
+        if args.stage == "all":
+            stages = PHONOPY_STAGES
+        elif args.stage == "phono3py-all":
+            stages = _phono3py_stages(config)
+        else:
+            stages = (args.stage,)
         for stage in stages:
             status = _maybe_relaunch(config, stage, args)
             if status is not None:
@@ -154,4 +165,14 @@ def _apply_extra_env(config: dict) -> None:
 def _print_status(config: dict) -> None:
     print(f"run_dir: {run_dir(config)}")
     for row in stage_status(config):
-        print(f"{row['stage']:9s} {row['status']:8s} {row['output']}")
+        print(f"{row['stage']:16s} {row['status']:8s} {row['output']}")
+
+
+def _phono3py_stages(config: dict) -> tuple[str, ...]:
+    stages = ["relax", "ph3-displace", "ph3-forces", "ph3-fc"]
+    methods = config["thermal_conductivity"].get("methods", ["rta", "iterative"])
+    if "rta" in methods:
+        stages.append("kappa-rta")
+    if "iterative" in methods:
+        stages.append("kappa-iterative")
+    return tuple(stages)

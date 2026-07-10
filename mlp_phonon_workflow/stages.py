@@ -4,6 +4,7 @@ import filecmp
 import json
 import os
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,20 +13,38 @@ from .calculators import build_calculator
 from .config import input_poscar, run_dir
 
 
-STAGES = ("relax", "displace", "forces", "band")
+PHONOPY_STAGES = ("relax", "displace", "forces", "band")
+PHONO3PY_ONLY_STAGES = (
+    "ph3-displace",
+    "ph3-forces",
+    "ph3-fc",
+    "kappa-rta",
+    "kappa-iterative",
+)
+STAGES = PHONOPY_STAGES + PHONO3PY_ONLY_STAGES
 
 STAGE_DIR_NAMES = {
     "relax": "01_relax",
     "displace": "02_displacements",
     "forces": "03_forces",
     "band": "04_band",
+    "ph3-displace": "05_phono3py_displacements",
+    "ph3-forces": "06_phono3py_forces",
+    "ph3-fc": "07_phono3py_force_constants",
+    "kappa-rta": "08_kappa_rta",
+    "kappa-iterative": "09_kappa_iterative",
 }
 
 EXPECTED_OUTPUTS = {
-    "relax": "POSCAR",
-    "displace": "phonopy_disp.yaml",
-    "forces": "FORCE_SETS",
-    "band": "band.yaml",
+    "relax": ("POSCAR",),
+    "displace": ("phonopy_disp.yaml",),
+    "forces": ("FORCE_SETS",),
+    "band": ("band.yaml",),
+    "ph3-displace": ("phono3py_disp.yaml", "displacement_manifest.json"),
+    "ph3-forces": ("forces_fc3.npy", "forces_fc2.npy", "completed.json"),
+    "ph3-fc": ("fc3.hdf5", "fc2.hdf5", "completed.json"),
+    "kappa-rta": ("completed.json",),
+    "kappa-iterative": ("completed.json",),
 }
 
 
@@ -57,19 +76,29 @@ def run_stage(config: dict[str, Any], stage: str, *, force: bool = False) -> Non
         _run_forces(config, force=force)
     elif stage == "band":
         _run_band(config, force=force)
+    elif stage == "ph3-displace":
+        _run_ph3_displace(config, force=force)
+    elif stage == "ph3-forces":
+        _run_ph3_forces(config, force=force)
+    elif stage == "ph3-fc":
+        _run_ph3_fc(config, force=force)
+    elif stage == "kappa-rta":
+        _run_thermal_conductivity(config, method="rta", force=force)
+    elif stage == "kappa-iterative":
+        _run_thermal_conductivity(config, method="iterative", force=force)
 
 
 def stage_status(config: dict[str, Any]) -> list[dict[str, str]]:
     rows = []
     for stage in STAGES:
         paths = stage_paths(config, stage)
-        expected = paths.output / EXPECTED_OUTPUTS[stage]
+        expected = [paths.output / name for name in EXPECTED_OUTPUTS[stage]]
         rows.append(
             {
                 "stage": stage,
                 "input": str(paths.input),
-                "output": str(expected),
-                "status": "done" if expected.exists() else "pending",
+                "output": ", ".join(str(path) for path in expected),
+                "status": "done" if all(path.exists() for path in expected) else "pending",
             }
         )
     return rows
@@ -85,10 +114,12 @@ def _run_relax(config: dict[str, Any], *, force: bool) -> None:
     if out_poscar.exists() and not force:
         print(f"[relax] skip: {out_poscar} exists")
         _populate_displace_input(config)
+        _populate_ph3_displace_input(config)
         return
 
     if force:
         _clear_matching_displace_input(config, out_poscar)
+        _clear_matching_ph3_displace_input(config, out_poscar)
         _clear_relax_success_outputs(paths)
 
     from ase.io import read, write
@@ -139,6 +170,7 @@ def _run_relax(config: dict[str, Any], *, force: bool) -> None:
 
     _write_json(paths.output / "metadata.json", metadata)
     _populate_displace_input(config)
+    _populate_ph3_displace_input(config)
 
 
 def _run_displace(config: dict[str, Any], *, force: bool) -> None:
@@ -399,6 +431,475 @@ def _run_band(config: dict[str, Any], *, force: bool) -> None:
     )
 
 
+def _run_ph3_displace(config: dict[str, Any], *, force: bool) -> None:
+    _populate_ph3_displace_input(config)
+    paths = stage_paths(config, "ph3-displace")
+    in_poscar = paths.input / "POSCAR"
+    if not in_poscar.exists():
+        raise FileNotFoundError(
+            f"Missing {in_poscar}. Put a POSCAR there or run the relax stage first."
+        )
+
+    if _stage_complete(config, "ph3-displace") and not force:
+        print(f"[ph3-displace] skip: outputs already exist in {paths.output}")
+        _populate_ph3_forces_input(config)
+        return
+
+    _clear_ph3_displacement_outputs(paths.output)
+
+    from phono3py import Phono3py
+    from phonopy.interface.calculator import (
+        read_crystal_structure,
+        write_crystal_structure,
+    )
+
+    ph3_config = config["phono3py"]
+    interface_mode = ph3_config.get("calculator", "vasp")
+    unitcell, structure_info = read_crystal_structure(
+        filename=in_poscar,
+        interface_mode=interface_mode,
+    )
+    if unitcell is None:
+        raise RuntimeError(f"phono3py could not read structure: {in_poscar}")
+
+    phonon_supercell_matrix = ph3_config.get("phonon_supercell_matrix")
+    if phonon_supercell_matrix == []:
+        phonon_supercell_matrix = None
+    ph3 = Phono3py(
+        unitcell,
+        supercell_matrix=ph3_config.get("supercell_matrix", [2, 2, 2]),
+        primitive_matrix=ph3_config.get("primitive_matrix", "auto"),
+        phonon_supercell_matrix=phonon_supercell_matrix,
+        cutoff_frequency=float(ph3_config.get("cutoff_frequency", 1.0e-4)),
+        is_symmetry=bool(ph3_config.get("is_symmetry", True)),
+        is_mesh_symmetry=bool(ph3_config.get("is_mesh_symmetry", True)),
+        use_grg=bool(ph3_config.get("use_grg", False)),
+        make_r0_average=bool(ph3_config.get("make_r0_average", True)),
+        symprec=float(ph3_config.get("symprec", 1.0e-5)),
+        calculator=interface_mode,
+        log_level=int(ph3_config.get("log_level", 1)),
+        lang=str(ph3_config.get("lang", "Rust")),
+    )
+
+    displacement_config = ph3_config["displacements"]
+    fc3_config = displacement_config.get("fc3", {})
+    fc2_config = displacement_config.get("fc2", {})
+    ph3.generate_displacements(
+        **_filtered_kwargs(
+            fc3_config,
+            {
+                "distance",
+                "cutoff_pair_distance",
+                "is_plusminus",
+                "is_diagonal",
+                "number_of_snapshots",
+                "random_seed",
+                "max_distance",
+                "number_estimation_factor",
+            },
+        )
+    )
+    ph3.generate_fc2_displacements(
+        **_filtered_kwargs(
+            fc2_config,
+            {
+                "distance",
+                "is_plusminus",
+                "is_diagonal",
+                "number_of_snapshots",
+                "random_seed",
+                "max_distance",
+            },
+        )
+    )
+
+    out_yaml = paths.output / "phono3py_disp.yaml"
+    ph3.save(filename=out_yaml)
+    write_crystal_structure(
+        paths.output / "POSCAR",
+        unitcell,
+        interface_mode=interface_mode,
+        optional_structure_info=structure_info,
+    )
+    write_crystal_structure(
+        paths.output / "SPOSCAR_FC3",
+        ph3.supercell,
+        interface_mode=interface_mode,
+        optional_structure_info=structure_info,
+    )
+    write_crystal_structure(
+        paths.output / "SPOSCAR_FC2",
+        ph3.phonon_supercell,
+        interface_mode=interface_mode,
+        optional_structure_info=structure_info,
+    )
+
+    zfill = int(displacement_config.get("zfill_width", 5))
+    fc3_entries = _write_ph3_supercells(
+        ph3.supercells_with_displacements,
+        paths.output,
+        prefix="FC3_POSCAR",
+        zfill=zfill,
+        interface_mode=interface_mode,
+        structure_info=structure_info,
+    )
+    fc2_entries = _write_ph3_supercells(
+        ph3.phonon_supercells_with_displacements,
+        paths.output,
+        prefix="FC2_POSCAR",
+        zfill=zfill,
+        interface_mode=interface_mode,
+        structure_info=structure_info,
+    )
+    manifest = {
+        "fc3": {
+            "entries": fc3_entries,
+            "n_atoms": len(ph3.supercell),
+        },
+        "fc2": {
+            "entries": fc2_entries,
+            "n_atoms": len(ph3.phonon_supercell),
+        },
+    }
+    _write_json(paths.output / "displacement_manifest.json", manifest)
+    _write_json(
+        paths.output / "metadata.json",
+        {
+            "stage": "ph3-displace",
+            "input": str(in_poscar),
+            "output": str(out_yaml),
+            "n_fc3_dataset_entries": len(fc3_entries),
+            "n_fc3_calculations": sum(x["filename"] is not None for x in fc3_entries),
+            "n_fc2_calculations": sum(x["filename"] is not None for x in fc2_entries),
+        },
+    )
+    _populate_ph3_forces_input(config)
+
+
+def _run_ph3_forces(config: dict[str, Any], *, force: bool) -> None:
+    _populate_ph3_forces_input(config)
+    paths = stage_paths(config, "ph3-forces")
+    in_yaml = paths.input / "phono3py_disp.yaml"
+    if not in_yaml.exists():
+        raise FileNotFoundError(
+            f"Missing {in_yaml}. Put phono3py_disp.yaml and displaced POSCARs in "
+            f"{paths.input}, or run ph3-displace first."
+        )
+
+    if _stage_complete(config, "ph3-forces") and not force:
+        print(f"[ph3-forces] skip: outputs already exist in {paths.output}")
+        _populate_ph3_fc_input(config)
+        return
+
+    manifest = _read_or_infer_ph3_manifest(paths.input)
+    if force:
+        _clear_ph3_force_checkpoints(paths.output)
+    for name in (
+        "forces_fc3.npy",
+        "forces_fc2.npy",
+        "energies_fc3.npy",
+        "energies_fc2.npy",
+        "completed.json",
+    ):
+        output_file = paths.output / name
+        if output_file.exists():
+            output_file.unlink()
+
+    calculator = build_calculator(config)
+    force_config = config["phono3py"].get("forces", {})
+    results: dict[str, tuple[Any, Any]] = {}
+    for kind in ("fc3", "fc2"):
+        results[kind] = _evaluate_ph3_force_kind(
+            kind,
+            manifest[kind],
+            paths,
+            calculator,
+            subtract_drift=bool(force_config.get("subtract_drift", True)),
+        )
+
+    import numpy as np
+
+    for kind, (force_array, energy_array) in results.items():
+        _atomic_save_npy(paths.output / f"forces_{kind}.npy", force_array)
+        if bool(force_config.get("write_energies", True)):
+            _atomic_save_npy(paths.output / f"energies_{kind}.npy", energy_array)
+
+    completed = {
+        "stage": "ph3-forces",
+        "input": str(in_yaml),
+        "n_fc3_dataset_entries": int(results["fc3"][0].shape[0]),
+        "n_fc2_dataset_entries": int(results["fc2"][0].shape[0]),
+    }
+    _write_json(paths.output / "metadata.json", completed)
+    _write_json(paths.output / "completed.json", completed)
+    _populate_ph3_fc_input(config)
+
+
+def _run_ph3_fc(config: dict[str, Any], *, force: bool) -> None:
+    _populate_ph3_fc_input(config)
+    paths = stage_paths(config, "ph3-fc")
+    in_yaml = paths.input / "phono3py_disp.yaml"
+    in_fc3_forces = paths.input / "forces_fc3.npy"
+    in_fc2_forces = paths.input / "forces_fc2.npy"
+    in_forces_fc3 = paths.input / "FORCES_FC3"
+    in_forces_fc2 = paths.input / "FORCES_FC2"
+    if not in_yaml.exists():
+        raise FileNotFoundError(f"Missing {in_yaml}.")
+    if not in_fc3_forces.exists() and not in_forces_fc3.exists():
+        raise FileNotFoundError(
+            f"Missing {in_fc3_forces} or standard phono3py file {in_forces_fc3}."
+        )
+    if not in_fc2_forces.exists() and not in_forces_fc2.exists():
+        raise FileNotFoundError(
+            f"Missing {in_fc2_forces} or standard phono3py file {in_forces_fc2}."
+        )
+
+    if _stage_complete(config, "ph3-fc") and not force:
+        print(f"[ph3-fc] skip: outputs already exist in {paths.output}")
+        _populate_kappa_inputs(config)
+        return
+
+    import numpy as np
+    import phono3py
+    from phono3py.file_IO import (
+        write_FORCES_FC2,
+        write_FORCES_FC3,
+        write_fc2_to_hdf5,
+        write_fc3_to_hdf5,
+    )
+
+    ph3_config = config["phono3py"]
+    fc_config = ph3_config.get("force_constants", {})
+    ph3 = phono3py.load(
+        phono3py_yaml=in_yaml,
+        forces_fc3_filename=(
+            in_forces_fc3
+            if in_forces_fc3.exists() and not in_fc3_forces.exists()
+            else None
+        ),
+        forces_fc2_filename=(
+            in_forces_fc2
+            if in_forces_fc2.exists() and not in_fc2_forces.exists()
+            else None
+        ),
+        calculator=ph3_config.get("calculator", "vasp"),
+        produce_fc=False,
+        is_symmetry=bool(ph3_config.get("is_symmetry", True)),
+        symprec=float(ph3_config.get("symprec", 1.0e-5)),
+        log_level=int(ph3_config.get("log_level", 1)),
+        lang=str(ph3_config.get("lang", "Rust")),
+    )
+    if in_fc3_forces.exists():
+        ph3.forces = np.load(in_fc3_forces)
+    if in_fc2_forces.exists():
+        ph3.phonon_forces = np.load(in_fc2_forces)
+    if ph3.forces is None or ph3.phonon_forces is None:
+        raise RuntimeError("Could not read both fc3 and fc2 forces.")
+
+    write_FORCES_FC3(
+        ph3.dataset,
+        forces_fc3=ph3.forces,
+        filename=paths.output / "FORCES_FC3",
+    )
+    write_FORCES_FC2(
+        ph3.phonon_dataset,
+        forces_fc2=ph3.phonon_forces,
+        filename=paths.output / "FORCES_FC2",
+    )
+
+    fc_calculator = str(fc_config.get("fc_calculator", "traditional")).strip() or None
+    fc_options = str(fc_config.get("fc_calculator_options", "")).strip() or None
+    common_kwargs = {
+        "is_compact_fc": bool(fc_config.get("is_compact_fc", True)),
+        "fc_calculator": fc_calculator,
+        "fc_calculator_options": fc_options,
+        "use_symfc_projector": bool(fc_config.get("use_symfc_projector", False)),
+    }
+    ph3.produce_fc3(
+        symmetrize_fc3r=bool(fc_config.get("symmetrize_fc3", True)),
+        **common_kwargs,
+    )
+    ph3.produce_fc2(
+        symmetrize_fc2=bool(fc_config.get("symmetrize_fc2", True)),
+        **common_kwargs,
+    )
+    if ph3.fc3 is None or ph3.fc2 is None:
+        raise RuntimeError("phono3py did not produce both fc3 and fc2.")
+
+    compression = fc_config.get("compression", "gzip")
+    write_fc3_to_hdf5(
+        ph3.fc3,
+        fc3_nonzero_indices=ph3.fc3_nonzero_indices,
+        filename=str(paths.output / "fc3.hdf5"),
+        p2s_map=ph3.primitive.p2s_map,
+        fc3_cutoff=ph3.fc3_cutoff,
+        compression=compression,
+    )
+    write_fc2_to_hdf5(
+        ph3.fc2,
+        filename=str(paths.output / "fc2.hdf5"),
+        p2s_map=ph3.phonon_primitive.p2s_map,
+        physical_unit="eV/angstrom^2",
+        cutoff=ph3.fc2_cutoff,
+        compression=compression,
+    )
+    ph3.save(filename=paths.output / "phono3py_params.yaml")
+
+    completed = {
+        "stage": "ph3-fc",
+        "input_phono3py_yaml": str(in_yaml),
+        "fc2_shape": list(ph3.fc2.shape),
+        "fc3_shape": list(ph3.fc3.shape),
+        "fc_calculator": fc_calculator,
+    }
+    _write_json(paths.output / "metadata.json", completed)
+    _write_json(paths.output / "completed.json", completed)
+    _populate_kappa_inputs(config)
+
+
+def _run_thermal_conductivity(
+    config: dict[str, Any], *, method: str, force: bool
+) -> None:
+    stage = f"kappa-{method}"
+    _populate_kappa_inputs(config)
+    paths = stage_paths(config, stage)
+    in_yaml = paths.input / "phono3py_disp.yaml"
+    in_fc2 = paths.input / "fc2.hdf5"
+    in_fc3 = paths.input / "fc3.hdf5"
+    for required in (in_yaml, in_fc2, in_fc3):
+        if not required.exists():
+            raise FileNotFoundError(
+                f"Missing {required}. Put phono3py_disp.yaml, fc2.hdf5, and "
+                f"fc3.hdf5 in {paths.input}, or run ph3-fc first."
+            )
+
+    if _stage_complete(config, stage) and not force:
+        print(f"[{stage}] skip: {paths.output / 'completed.json'} exists")
+        return
+    completed_file = paths.output / "completed.json"
+    if completed_file.exists():
+        completed_file.unlink()
+
+    import numpy as np
+    import phono3py
+
+    ph3_config = config["phono3py"]
+    thermal_config = config["thermal_conductivity"]
+    born_file = paths.input / "BORN"
+    ph3 = phono3py.load(
+        phono3py_yaml=in_yaml,
+        fc2_filename=in_fc2,
+        fc3_filename=in_fc3,
+        born_filename=born_file if born_file.exists() else None,
+        calculator=ph3_config.get("calculator", "vasp"),
+        produce_fc=False,
+        is_symmetry=bool(ph3_config.get("is_symmetry", True)),
+        is_mesh_symmetry=bool(ph3_config.get("is_mesh_symmetry", True)),
+        use_grg=bool(ph3_config.get("use_grg", False)),
+        make_r0_average=bool(ph3_config.get("make_r0_average", True)),
+        symprec=float(ph3_config.get("symprec", 1.0e-5)),
+        log_level=int(ph3_config.get("log_level", 1)),
+        lang=str(ph3_config.get("lang", "Rust")),
+    )
+    ph3.mesh_numbers = thermal_config.get("mesh", [8, 8, 8])
+    sigmas = thermal_config.get("sigmas", [])
+    ph3.sigmas = (
+        [None]
+        if not sigmas
+        else [None if x == "tetrahedron" else float(x) for x in sigmas]
+    )
+    if thermal_config.get("sigma_cutoff") is not None:
+        ph3.sigma_cutoff = float(thermal_config["sigma_cutoff"])
+    if thermal_config.get("band_indices"):
+        ph3.band_indices = thermal_config["band_indices"]
+
+    ph3.init_phph_interaction(
+        nac_q_direction=thermal_config.get("nac_q_direction") or None,
+        constant_averaged_interaction=_optional_float(
+            thermal_config.get("constant_averaged_interaction")
+        ),
+        frequency_scale_factor=_optional_float(
+            thermal_config.get("frequency_scale_factor")
+        ),
+        symmetrize_fc3q=bool(thermal_config.get("symmetrize_fc3q", False)),
+        lapack_zheev_uplo=thermal_config.get("lapack_zheev_uplo"),
+        openmp_per_triplets=thermal_config.get("openmp_per_triplets"),
+    )
+
+    temperatures = thermal_config.get("temperatures") or None
+    common_kwargs = {
+        "temperatures": temperatures,
+        "is_isotope": bool(thermal_config.get("is_isotope", False)),
+        "mass_variances": thermal_config.get("mass_variances") or None,
+        "grid_points": thermal_config.get("grid_points") or None,
+        "boundary_mfp": _optional_float(thermal_config.get("boundary_mfp")),
+        "solve_collective_phonon": bool(
+            thermal_config.get("solve_collective_phonon", False)
+        ),
+        "is_kappa_star": bool(thermal_config.get("is_kappa_star", True)),
+        "gv_delta_q": _optional_float(thermal_config.get("gv_delta_q")),
+        "is_full_pp": bool(thermal_config.get("is_full_pp", False)),
+        "transport_type": thermal_config.get("transport_type"),
+        "write_kappa": True,
+        "compression": thermal_config.get("compression", "gzip"),
+        "log_level": int(ph3_config.get("log_level", 1)),
+    }
+    if method == "rta":
+        method_config = thermal_config.get("rta", {})
+        method_kwargs = {
+            "use_ave_pp": bool(method_config.get("use_ave_pp", False)),
+            "write_gamma": bool(method_config.get("write_gamma", False)),
+            "read_gamma": bool(method_config.get("read_gamma", False)),
+            "is_N_U": bool(method_config.get("is_N_U", False)),
+            "write_gamma_detail": bool(method_config.get("write_gamma_detail", False)),
+            "write_pp": bool(method_config.get("write_pp", False)),
+            "read_pp": bool(method_config.get("read_pp", False)),
+        }
+    else:
+        method_config = thermal_config.get("iterative", {})
+        read_collision = method_config.get("read_collision", False)
+        method_kwargs = {
+            "is_reducible_collision_matrix": bool(
+                method_config.get("is_reducible_collision_matrix", False)
+            ),
+            "pinv_cutoff": _optional_float(method_config.get("pinv_cutoff")),
+            "pinv_method": int(method_config.get("pinv_method", 0)),
+            "pinv_solver": int(method_config.get("pinv_solver", 0)),
+            "write_collision": bool(method_config.get("write_collision", False)),
+            "read_collision": read_collision if read_collision else None,
+            "write_pp": bool(method_config.get("write_pp", False)),
+            "read_pp": bool(method_config.get("read_pp", False)),
+            "write_LBTE_solution": bool(method_config.get("write_LBTE_solution", False)),
+        }
+
+    with _working_directory(paths.output):
+        ph3.run_thermal_conductivity(
+            is_LBTE=method == "iterative",
+            **common_kwargs,
+            **method_kwargs,
+        )
+
+    result = ph3.thermal_conductivity
+    result_arrays = {}
+    for name in ("temperatures", "kappa", "kappa_RTA", "mode_kappa", "mode_kappa_RTA"):
+        value = getattr(result, name, None)
+        if value is not None:
+            result_arrays[name] = np.asarray(value)
+    if result_arrays:
+        np.savez_compressed(paths.output / "thermal_conductivity.npz", **result_arrays)
+
+    generated_hdf5 = sorted(path.name for path in paths.output.glob("*.hdf5"))
+    completed = {
+        "stage": stage,
+        "method": "RTA" if method == "rta" else "full iterative LBTE",
+        "mesh": thermal_config.get("mesh", [8, 8, 8]),
+        "temperatures": temperatures,
+        "hdf5_outputs": generated_hdf5,
+    }
+    _write_json(paths.output / "metadata.json", completed)
+    _write_json(completed_file, completed)
+
+
 def _band_nqpoints(band_config: dict[str, Any]) -> int:
     if "nqpoints" in band_config:
         value = band_config["nqpoints"]
@@ -415,6 +916,13 @@ def _populate_displace_input(config: dict[str, Any]) -> None:
     displace_in = stage_paths(config, "displace").input / "POSCAR"
     if relax_out.exists():
         _copy_file(relax_out, displace_in, overwrite=_overwrite_next_inputs(config))
+
+
+def _populate_ph3_displace_input(config: dict[str, Any]) -> None:
+    relax_out = stage_paths(config, "relax").output / "POSCAR"
+    ph3_in = stage_paths(config, "ph3-displace").input / "POSCAR"
+    if relax_out.exists():
+        _copy_file(relax_out, ph3_in, overwrite=_overwrite_next_inputs(config))
 
 
 def _populate_forces_input(config: dict[str, Any]) -> None:
@@ -445,6 +953,61 @@ def _populate_band_input(config: dict[str, Any]) -> None:
         _copy_file(params, band_in / params.name, overwrite=overwrite)
 
 
+def _populate_ph3_forces_input(config: dict[str, Any]) -> None:
+    source_paths = stage_paths(config, "ph3-displace")
+    destination = stage_paths(config, "ph3-forces").input
+    overwrite = _overwrite_next_inputs(config)
+    fixed_names = (
+        "POSCAR",
+        "SPOSCAR_FC3",
+        "SPOSCAR_FC2",
+        "phono3py_disp.yaml",
+        "displacement_manifest.json",
+    )
+    for name in fixed_names:
+        source = source_paths.output / name
+        if source.exists():
+            _copy_file(source, destination / name, overwrite=overwrite)
+    for source in _ph3_displacement_poscars(source_paths.output):
+        _copy_file(source, destination / source.name, overwrite=overwrite)
+    born = source_paths.input / "BORN"
+    if born.exists():
+        _copy_file(born, destination / "BORN", overwrite=overwrite)
+
+
+def _populate_ph3_fc_input(config: dict[str, Any]) -> None:
+    force_paths = stage_paths(config, "ph3-forces")
+    destination = stage_paths(config, "ph3-fc").input
+    overwrite = _overwrite_next_inputs(config)
+    for source in (
+        force_paths.input / "phono3py_disp.yaml",
+        force_paths.output / "forces_fc3.npy",
+        force_paths.output / "forces_fc2.npy",
+        force_paths.output / "energies_fc3.npy",
+        force_paths.output / "energies_fc2.npy",
+        force_paths.input / "BORN",
+    ):
+        if source.exists():
+            _copy_file(source, destination / source.name, overwrite=overwrite)
+
+
+def _populate_kappa_inputs(config: dict[str, Any]) -> None:
+    fc_paths = stage_paths(config, "ph3-fc")
+    overwrite = _overwrite_next_inputs(config)
+    sources = (
+        fc_paths.input / "phono3py_disp.yaml",
+        fc_paths.output / "phono3py_params.yaml",
+        fc_paths.output / "fc3.hdf5",
+        fc_paths.output / "fc2.hdf5",
+        fc_paths.input / "BORN",
+    )
+    for stage in ("kappa-rta", "kappa-iterative"):
+        destination = stage_paths(config, stage).input
+        for source in sources:
+            if source.exists():
+                _copy_file(source, destination / source.name, overwrite=overwrite)
+
+
 def _overwrite_next_inputs(config: dict[str, Any]) -> bool:
     return bool(config["workflow"].get("overwrite_next_inputs", False))
 
@@ -464,6 +1027,208 @@ def _displacement_poscars(directory: Path) -> list[Path]:
         for path in directory.glob("POSCAR-*")
         if path.is_file() and path.name.split("-")[-1].isdigit()
     )
+
+
+def _ph3_displacement_poscars(directory: Path) -> list[Path]:
+    return sorted(
+        path
+        for prefix in ("FC3_POSCAR-*", "FC2_POSCAR-*")
+        for path in directory.glob(prefix)
+        if path.is_file() and path.name.split("-")[-1].isdigit()
+    )
+
+
+def _stage_complete(config: dict[str, Any], stage: str) -> bool:
+    output = stage_paths(config, stage).output
+    return all((output / name).exists() for name in EXPECTED_OUTPUTS[stage])
+
+
+def _write_ph3_supercells(
+    supercells: Iterable[Any],
+    output_dir: Path,
+    *,
+    prefix: str,
+    zfill: int,
+    interface_mode: str,
+    structure_info: Any,
+) -> list[dict[str, Any]]:
+    from phonopy.interface.calculator import write_crystal_structure
+
+    entries = []
+    for index, supercell in enumerate(supercells, start=1):
+        filename = None
+        if supercell is not None:
+            filename = f"{prefix}-{index:0{zfill}d}"
+            write_crystal_structure(
+                output_dir / filename,
+                supercell,
+                interface_mode=interface_mode,
+                optional_structure_info=structure_info,
+            )
+        entries.append({"index": index, "filename": filename})
+    return entries
+
+
+def _clear_ph3_displacement_outputs(output_dir: Path) -> None:
+    for path in _ph3_displacement_poscars(output_dir):
+        path.unlink()
+    for name in (
+        "POSCAR",
+        "SPOSCAR_FC3",
+        "SPOSCAR_FC2",
+        "phono3py_disp.yaml",
+        "displacement_manifest.json",
+        "metadata.json",
+    ):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def _read_or_infer_ph3_manifest(input_dir: Path) -> dict[str, Any]:
+    manifest_path = input_dir / "displacement_manifest.json"
+    if manifest_path.exists():
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    from ase.io import read
+
+    manifest = {}
+    for kind, pattern in (("fc3", "FC3_POSCAR-*"), ("fc2", "FC2_POSCAR-*")):
+        files = sorted(
+            path
+            for path in input_dir.glob(pattern)
+            if path.is_file() and path.name.split("-")[-1].isdigit()
+        )
+        if not files:
+            raise FileNotFoundError(
+                f"No {pattern} files found in {input_dir}. A manually supplied "
+                "ph3-forces input needs both FC3_POSCAR-* and FC2_POSCAR-* files."
+            )
+        indices = [int(path.name.split("-")[-1]) for path in files]
+        files_by_index = dict(zip(indices, files))
+        entries = [
+            {
+                "index": index,
+                "filename": files_by_index[index].name if index in files_by_index else None,
+            }
+            for index in range(1, max(indices) + 1)
+        ]
+        manifest[kind] = {
+            "entries": entries,
+            "n_atoms": len(read(files[0], format="vasp")),
+        }
+    return manifest
+
+
+def _evaluate_ph3_force_kind(
+    kind: str,
+    manifest: dict[str, Any],
+    paths: StagePaths,
+    calculator: Any,
+    *,
+    subtract_drift: bool,
+):
+    import numpy as np
+    from ase.io import read
+
+    entries = manifest["entries"]
+    n_atoms = int(manifest["n_atoms"])
+    checkpoint_dir = paths.output / "checkpoints" / kind
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    forces = []
+    energies = []
+    n_calculations = sum(entry.get("filename") is not None for entry in entries)
+    calculation_index = 0
+
+    for entry in entries:
+        index = int(entry["index"])
+        filename = entry.get("filename")
+        if filename is None:
+            forces.append(np.zeros((n_atoms, 3), dtype=float))
+            energies.append(np.nan)
+            continue
+
+        calculation_index += 1
+        checkpoint = checkpoint_dir / f"force-{index:05d}.npz"
+        if checkpoint.exists():
+            with np.load(checkpoint) as data:
+                force = np.asarray(data["forces"], dtype=float)
+                energy = float(data["energy"])
+            if force.shape != (n_atoms, 3):
+                raise RuntimeError(
+                    f"Invalid checkpoint shape in {checkpoint}: {force.shape}, "
+                    f"expected {(n_atoms, 3)}."
+                )
+            print(
+                f"[ph3-forces:{kind}] resume "
+                f"{calculation_index:05d}/{n_calculations:05d}"
+            )
+        else:
+            source = paths.input / filename
+            if not source.exists():
+                raise FileNotFoundError(f"Missing displaced structure: {source}")
+            atoms = read(source, format="vasp")
+            if len(atoms) != n_atoms:
+                raise RuntimeError(
+                    f"{source} has {len(atoms)} atoms, but manifest expects {n_atoms}."
+                )
+            atoms.calc = calculator
+            force = np.asarray(atoms.get_forces(), dtype=float)
+            drift = force.mean(axis=0)
+            if subtract_drift:
+                force = force - drift[None, :]
+            energy_value = _safe_float(lambda: atoms.get_potential_energy())
+            energy = np.nan if energy_value is None else energy_value
+            _atomic_save_npz(checkpoint, forces=force, energy=np.asarray(energy))
+            print(
+                f"[ph3-forces:{kind}] {calculation_index:05d}/{n_calculations:05d} "
+                f"{filename}, drift={np.linalg.norm(drift):.3e} eV/A"
+            )
+        forces.append(force)
+        energies.append(energy)
+
+    return np.asarray(forces, dtype=float), np.asarray(energies, dtype=float)
+
+
+def _clear_ph3_force_checkpoints(output_dir: Path) -> None:
+    checkpoint_root = output_dir / "checkpoints"
+    if not checkpoint_root.exists():
+        return
+    for path in checkpoint_root.glob("*/*.npz"):
+        path.unlink()
+
+
+def _atomic_save_npy(path: Path, array: Any) -> None:
+    import numpy as np
+
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        np.save(handle, array)
+    os.replace(temporary, path)
+
+
+def _atomic_save_npz(path: Path, **arrays: Any) -> None:
+    import numpy as np
+
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **arrays)
+    os.replace(temporary, path)
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None or value == "" else float(value)
+
+
+@contextmanager
+def _working_directory(path: Path):
+    previous = Path.cwd()
+    path.mkdir(parents=True, exist_ok=True)
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 def _phonopy_atoms_to_ase(cell: Any):
@@ -498,6 +1263,18 @@ def _clear_matching_displace_input(config: dict[str, Any], relax_poscar: Path) -
         and filecmp.cmp(relax_poscar, displace_poscar, shallow=False)
     ):
         displace_poscar.unlink()
+
+
+def _clear_matching_ph3_displace_input(
+    config: dict[str, Any], relax_poscar: Path
+) -> None:
+    ph3_poscar = stage_paths(config, "ph3-displace").input / "POSCAR"
+    if (
+        relax_poscar.exists()
+        and ph3_poscar.exists()
+        and filecmp.cmp(relax_poscar, ph3_poscar, shallow=False)
+    ):
+        ph3_poscar.unlink()
 
 
 def _max_force(atoms: Any) -> float:

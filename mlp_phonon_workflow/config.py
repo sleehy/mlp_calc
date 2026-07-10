@@ -94,6 +94,89 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "paths": [],
         "labels": [],
     },
+    "phono3py": {
+        "calculator": "vasp",
+        "supercell_matrix": [2, 2, 2],
+        "phonon_supercell_matrix": [2, 2, 2],
+        "primitive_matrix": "auto",
+        "symprec": 1.0e-5,
+        "is_symmetry": True,
+        "is_mesh_symmetry": True,
+        "use_grg": False,
+        "make_r0_average": True,
+        "cutoff_frequency": 1.0e-4,
+        "log_level": 1,
+        "lang": "Rust",
+        "displacements": {
+            "zfill_width": 5,
+            "fc3": {
+                "distance": 0.03,
+                "is_plusminus": "auto",
+                "is_diagonal": True,
+            },
+            "fc2": {
+                "distance": 0.03,
+                "is_plusminus": "auto",
+                "is_diagonal": False,
+            },
+        },
+        "forces": {
+            "subtract_drift": True,
+            "write_energies": True,
+        },
+        "force_constants": {
+            "fc_calculator": "traditional",
+            "fc_calculator_options": "",
+            "symmetrize_fc2": True,
+            "symmetrize_fc3": True,
+            "is_compact_fc": True,
+            "use_symfc_projector": False,
+            "compression": "gzip",
+        },
+    },
+    "thermal_conductivity": {
+        "methods": ["rta", "iterative"],
+        "mesh": [8, 8, 8],
+        "temperatures": [300.0],
+        "sigmas": [],
+        "sigma_cutoff": None,
+        "is_isotope": False,
+        "mass_variances": [],
+        "boundary_mfp": None,
+        "is_kappa_star": True,
+        "gv_delta_q": None,
+        "is_full_pp": False,
+        "transport_type": None,
+        "compression": "gzip",
+        "frequency_scale_factor": None,
+        "constant_averaged_interaction": None,
+        "nac_q_direction": [],
+        "symmetrize_fc3q": False,
+        "lapack_zheev_uplo": None,
+        "openmp_per_triplets": None,
+        "grid_points": [],
+        "solve_collective_phonon": False,
+        "rta": {
+            "use_ave_pp": False,
+            "write_gamma": False,
+            "read_gamma": False,
+            "is_N_U": False,
+            "write_gamma_detail": False,
+            "write_pp": False,
+            "read_pp": False,
+        },
+        "iterative": {
+            "is_reducible_collision_matrix": False,
+            "pinv_cutoff": 1.0e-8,
+            "pinv_method": 0,
+            "pinv_solver": 0,
+            "write_collision": False,
+            "read_collision": False,
+            "write_pp": False,
+            "read_pp": False,
+            "write_LBTE_solution": False,
+        },
+    },
 }
 
 
@@ -162,6 +245,30 @@ def validate_config(config: dict[str, Any]) -> None:
             f"Unsupported calculator '{calculator}' for mlp.{mlp_name}."
         )
 
+    methods = config.get("thermal_conductivity", {}).get("methods", [])
+    if not isinstance(methods, list):
+        raise ConfigError("thermal_conductivity.methods must be a list.")
+    invalid_methods = sorted(set(methods) - {"rta", "iterative"})
+    if invalid_methods:
+        raise ConfigError(
+            "thermal_conductivity.methods only accepts 'rta' and 'iterative': "
+            + ", ".join(invalid_methods)
+        )
+
+    mesh = config.get("thermal_conductivity", {}).get("mesh", [])
+    if not isinstance(mesh, list) or len(mesh) != 3:
+        raise ConfigError(
+            "thermal_conductivity.mesh must contain 3 mesh numbers or three "
+            "rows of a 3x3 grid matrix."
+        )
+    if any(isinstance(row, list) for row in mesh) and not all(
+        isinstance(row, list) and len(row) == 3 for row in mesh
+    ):
+        raise ConfigError(
+            "thermal_conductivity.mesh must be either 3 numbers or a complete "
+            "3x3 matrix."
+        )
+
 
 def active_mlp(config: dict[str, Any]) -> str:
     return str(config["workflow"]["active_mlp"])
@@ -201,7 +308,15 @@ def input_poscar(config: dict[str, Any]) -> Path:
 def conda_env_for_stage(config: dict[str, Any], stage: str) -> str:
     mlp_name = active_mlp(config)
     mlp_env = str(config["mlp"][mlp_name].get("conda_env", ""))
-    if stage in {"relax", "forces"}:
+    if stage in {
+        "relax",
+        "forces",
+        "ph3-displace",
+        "ph3-forces",
+        "ph3-fc",
+        "kappa-rta",
+        "kappa-iterative",
+    }:
         return mlp_env
     phonopy_env = str(config["execution"].get("phonopy_conda_env", ""))
     return phonopy_env or mlp_env
