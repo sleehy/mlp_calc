@@ -12,6 +12,23 @@ phonopy_conda_env = ""            # empty means use the selected MLP env
 MPLCONFIGDIR = "{run_dir}/.matplotlib"
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
 
+[plot_archive]
+enabled = true                    # copy plot inputs out of runs/{mlp}/ automatically
+root = "plot_archive"             # creates plot_archive/{mlp}/...
+overwrite = true                  # keep the archive synchronized with stage OUTPUT
+
+[dos]
+enabled = true                    # generate DOS automatically after ph3-fc
+mesh = [40, 40, 40]               # independent reciprocal-space q-point mesh
+method = "tetrahedron"            # tetrahedron or gaussian
+# sigma = 0.1                     # THz; required only for gaussian
+# frequency_min = -1.0            # THz; optional
+# frequency_max = 20.0            # THz; optional
+# frequency_pitch = 0.02          # THz; optional
+is_gamma_center = true
+is_mesh_symmetry = true
+dpi = 200
+
 [mlp.mattersim]
 calculator = "mattersim"
 conda_env = "mattersim_env"
@@ -37,9 +54,8 @@ calculator = "sevennet"
 conda_env = "sevenn_env"
 
 [mlp.sevennet.kwargs]
-model = "7net-omni"                  # or a local checkpoint path
+model = "/home/eoung/mlp_calc/best.pth"
 device = "auto"
-modal = "mpa"
 
 [relax]
 optimizer = "BFGS"               # LBFGS, BFGS, or FIRE
@@ -134,7 +150,7 @@ compression = "gzip"               # gzip, lzf, or an integer compression level
 
 [thermal_conductivity]
 methods = ["rta"]     # used by the phono3py-all command
-mesh = [30, 30, 30]                    # convergence testing is required
+mesh = [20, 20, 20]                    # convergence testing is required
 temperatures = [300.0]
 sigmas = []                         # []: tetrahedron; e.g. [0.1] for smearing
 # sigma_cutoff = 3.0
@@ -174,3 +190,10 @@ read_collision = false
 write_pp = false
 read_pp = false
 write_LBTE_solution = false          # can create very large files
+
+[thermal_conductivity.plots]
+enabled = true                       # plot DOS from RTA fc2 and kappa from generated HDF5 files
+bins = 100
+mfp_unit = "nm"                      # angstrom, nm, or um
+dpi = 200
+temperatures = []                    # [] plots every temperature in the HDF5 file

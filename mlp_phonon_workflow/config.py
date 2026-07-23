@@ -27,6 +27,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",
         },
     },
+    "plot_archive": {
+        "enabled": True,
+        "root": "plot_archive",
+        "overwrite": True,
+    },
+    "dos": {
+        "enabled": True,
+        "mesh": [40, 40, 40],
+        "method": "tetrahedron",
+        "sigma": None,
+        "frequency_min": None,
+        "frequency_max": None,
+        "frequency_pitch": None,
+        "is_gamma_center": True,
+        "is_mesh_symmetry": True,
+        "dpi": 200,
+    },
     "mlp": {
         "mattersim": {
             "calculator": "mattersim",
@@ -176,6 +193,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "read_pp": False,
             "write_LBTE_solution": False,
         },
+        "plots": {
+            "enabled": True,
+            "bins": 200,
+            "mfp_unit": "nm",
+            "dpi": 200,
+            "temperatures": [],
+        },
     },
 }
 
@@ -269,6 +293,38 @@ def validate_config(config: dict[str, Any]) -> None:
             "3x3 matrix."
         )
 
+    plot_config = config.get("thermal_conductivity", {}).get("plots", {})
+    mfp_unit = str(plot_config.get("mfp_unit", "nm"))
+    if mfp_unit not in {"angstrom", "nm", "um"}:
+        raise ConfigError(
+            "thermal_conductivity.plots.mfp_unit must be 'angstrom', 'nm', or 'um'."
+        )
+    if int(plot_config.get("bins", 200)) < 2:
+        raise ConfigError("thermal_conductivity.plots.bins must be at least 2.")
+
+    archive_config = config.get("plot_archive", {})
+    if bool(archive_config.get("enabled", True)):
+        archive_root = str(archive_config.get("root", "plot_archive")).strip()
+        if not archive_root:
+            raise ConfigError("plot_archive.root must not be empty when enabled.")
+
+    dos_config = config.get("dos", {})
+    dos_mesh = dos_config.get("mesh", [40, 40, 40])
+    if (
+        not isinstance(dos_mesh, list)
+        or len(dos_mesh) != 3
+        or any(int(value) <= 0 for value in dos_mesh)
+    ):
+        raise ConfigError("dos.mesh must contain three positive integers.")
+    dos_method = str(dos_config.get("method", "tetrahedron")).lower()
+    if dos_method not in {"tetrahedron", "gaussian"}:
+        raise ConfigError("dos.method must be 'tetrahedron' or 'gaussian'.")
+    dos_sigma = dos_config.get("sigma")
+    if dos_method == "gaussian" and (
+        dos_sigma is None or float(dos_sigma) <= 0
+    ):
+        raise ConfigError("dos.sigma must be positive when dos.method='gaussian'.")
+
 
 def active_mlp(config: dict[str, Any]) -> str:
     return str(config["workflow"]["active_mlp"])
@@ -298,6 +354,11 @@ def _expand_text(value: str, values: dict[str, str]) -> str:
 
 def run_dir(config: dict[str, Any]) -> Path:
     return Path(context(config)["run_dir"])
+
+
+def plot_archive_root(config: dict[str, Any]) -> Path:
+    raw = expand_text(str(config["plot_archive"].get("root", "plot_archive")), config)
+    return _as_abs_path(raw, config["_meta"]["config_dir"])
 
 
 def input_poscar(config: dict[str, Any]) -> Path:

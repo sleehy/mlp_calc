@@ -1,6 +1,9 @@
-import yaml
-import numpy as np
+from pathlib import Path
+
 import matplotlib
+import numpy as np
+import yaml
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -8,9 +11,9 @@ import matplotlib.pyplot as plt
 # -------------------------
 # 0. 파일 경로 설정
 # -------------------------
-band_yaml_path = "runs/mattersim/04_band/OUTPUT/band.yaml"
+band_yaml_path = "plot_archive/mattersim/band/inputs/band.yaml"
 experiment_csv_path = "experiment_points.csv"
-output_png_path = "band_plot_mattersim_new_relax.png"
+output_png_path = "plot_archive/mattersim/band/plots/band_plot_with_experiment.png"
 
 
 # -------------------------
@@ -220,6 +223,7 @@ plt.xlabel("Wave vector")
 plt.ylabel("Frequency (THz)")
 plt.xlim(web_hs["G"], web_hs["L"])
 plt.tight_layout()
+Path(output_png_path).parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(output_png_path, dpi=300)
 plt.close()
 

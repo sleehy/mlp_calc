@@ -72,6 +72,152 @@ python -m mlp_phonon_workflow run kappa-rta -c config.toml
 python -m mlp_phonon_workflow run kappa-iterative -c config.toml
 ```
 
+Each conductivity stage automatically creates four plots when
+`thermal_conductivity.plots.enabled = true`:
+
+- phonon density of states (DOS) vs frequency (THz)
+- spectral thermal conductivity vs frequency (THz)
+- cumulative thermal conductivity vs frequency (THz)
+- cumulative thermal conductivity vs mean free path (log scale; nm by default)
+
+Only the isotropic average `(kappa_xx + kappa_yy + kappa_zz) / 3` is plotted.
+The DOS is calculated directly from
+`runs/{mlp}/08_kappa_rta/INPUT/fc2.hdf5` and its phono3py YAML; LBTE inputs are
+not used for the DOS. Conductivity curves still use their corresponding RTA or
+LBTE `kappa-*.hdf5` data.
+The RTA stage reads `mode_kappa`; the iterative stage reconstructs full LBTE
+mode contributions and mean free paths from `f_vector`. Each source file and
+temperature is retained in the CSV and metadata. Plot legends use the compact
+`mlp/rta-or-lbte/NxNxN` form. RTA and LBTE inputs can be overlaid in
+the same figures under one `plots/` directory. Plot settings such as the number of bins,
+MFP unit, DPI, and temperatures are configured in
+`[thermal_conductivity.plots]`.
+
+For automatic stage plotting, the workflow reads every `kappa-*.hdf5` in the
+current stage output directory: `runs/{mlp}/08_kappa_rta/OUTPUT/` for RTA and
+`runs/{mlp}/09_kappa_iterative/OUTPUT/` for iterative LBTE (with `runs/{mlp}`
+replaced by `workflow.run_dir`). The standalone `plot-kappa` command instead
+reads exactly the HDF5 paths supplied as positional arguments.
+
+Existing phono3py conductivity files can be plotted without rerunning a
+conductivity calculation. Activate the conda environment used for that MLP and
+run. The command reads `[thermal_conductivity.plots]` from `config.toml` by
+default; use `-c` for another config, or `--bins`, `--mfp-unit`, `--dpi`, and
+`--temperature` to override individual settings. For a manual one-off plot,
+write outside `plot_archive` so the managed archive is not duplicated:
+
+```bash
+python -m mlp_phonon_workflow plot-kappa \
+  plot_archive/mattersim/thermal_conductivity/rta/inputs/kappa-m252525.hdf5 \
+  plot_archive/mattersim/thermal_conductivity/lbte/inputs/kappa-m252525.hdf5 \
+  plot_archive/mace_mp/thermal_conductivity/rta/inputs/kappa-m252525.hdf5 \
+  plot_archive/mace_mp/thermal_conductivity/lbte/inputs/kappa-m252525.hdf5 \
+  plot_archive/sevennet/thermal_conductivity/rta/inputs/kappa-m252525.hdf5 \
+  plot_archive/sevennet/thermal_conductivity/lbte/inputs/kappa-m252525.hdf5 \
+  --method auto --temperature 300 --mfp-unit nm \
+  --output-dir 
+```
+
+The command creates phonon DOS, spectral conductivity, cumulative conductivity
+vs frequency, and cumulative conductivity vs mean free path under
+`/tmp/kappa_plots/plots/`. A `combined` output directory is never used; all
+explicitly supplied input cases are overlaid in the same figures, without
+method-specific plot directories.
+LBTE plotting
+requires `f_vector`,
+`group_velocity`, `heat_capacity`, `weight`, `kappa_unit_conversion`, and
+`kappa` datasets. With the current phono3py writer, `f_vector` has no
+temperature dimension, so an LBTE HDF5 file containing multiple temperatures
+must instead be generated separately for each temperature.
+
+### DOS with an independent mesh
+
+`plot-kappa` reports a DOS histogram on the conductivity file's existing mesh.
+For a converged harmonic DOS on a separately selected reciprocal-space mesh,
+use `plot-dos`. It reads `phono3py_params.yaml` and `fc2.hdf5` from the
+`ph3-fc` result, so neither MLP forces nor thermal conductivity are recomputed:
+
+```bash
+python -m mlp_phonon_workflow plot-dos --mlp mattersim --mesh 40 40 40
+python -m mlp_phonon_workflow plot-dos --mlp mace_mp  --mesh 40 40 40
+python -m mlp_phonon_workflow plot-dos --mlp sevennet --mesh 40 40 40
+```
+
+To calculate the same independent mesh for several MLPs and overlay their DOS
+curves in one figure, list all MLPs after a single `--mlp` option:
+
+```bash
+python -m mlp_phonon_workflow plot-dos \
+  --mlp mattersim mace_mp sevennet \
+  --mesh 40 40 40
+```
+
+Each MLP keeps its own reproducible DOS output. The comparison is written to
+`plot_archive/plots/dos/mesh-40x40x40/` and does not create a `combined`
+directory. Use `--output-dir` to select another comparison output root.
+
+Each command automatically relaunches into that MLP's configured conda
+environment. Tetrahedron integration is the default. Gaussian smearing is also
+available, for example `--method gaussian --sigma 0.1`. The default mesh and
+integration settings are configurable independently of the IFC supercell and
+the conductivity mesh:
+
+```toml
+[dos]
+enabled = true
+mesh = [40, 40, 40]
+method = "tetrahedron"
+is_gamma_center = true
+is_mesh_symmetry = true
+dpi = 200
+```
+
+After every `ph3-fc` completion or skip, the DOS inputs are archived and the
+configured DOS mesh is generated automatically under each MLP's own directory.
+
+## Plot archive
+
+Files needed to reproduce band, DOS, and thermal-conductivity plots are copied
+automatically from each stage `OUTPUT/` into a simpler archive tree when
+`plot_archive.enabled = true`:
+
+```text
+plot_archive/{mlp}/
+  band/inputs/
+    band.yaml
+    phonopy_params.yaml
+  dos/
+    inputs/{phono3py_params.yaml,fc2.hdf5}
+    mesh-NxNxN/
+      inputs/{phono3py_params.yaml,fc2.hdf5}
+      {phonon_dos.png,phonon_dos.csv,metadata.json}
+  thermal_conductivity/
+    rta/
+      inputs/kappa-*.hdf5
+    lbte/
+      inputs/kappa-*.hdf5
+    plots/{phonon_dos,spectral_thermal_conductivity,...}.{png,csv}
+
+plot_archive/plots/dos/mesh-NxNxN/
+  {phonon_dos.png,phonon_dos.csv,metadata.json}
+```
+
+Band files are synchronized after the `band` stage. Conductivity HDF5 files are
+synchronized after `kappa-rta` or `kappa-iterative`, and the DOS and conductivity
+plots are regenerated from all RTA and LBTE HDF5 files currently archived for
+that MLP. No combined archive
+directory is generated; every plot and metadata file remains under its source
+MLP directory. Synchronization runs when an already completed stage is skipped,
+so it can be applied to older run directories without recomputing the
+calculation. Configure the location and update behavior with:
+
+```toml
+[plot_archive]
+enabled = true
+root = "plot_archive"
+overwrite = true
+```
+
 To switch potential without editing the config:
 
 ```bash
@@ -143,3 +289,14 @@ to refresh downstream inputs automatically.
 ```bash
 python -m mlp_phonon_workflow status -c config.toml
 ```
+
+## Code layout
+
+The workflow keeps `stages.py` as a small public façade and separates each
+responsibility into focused modules:
+
+- `phonopy_stages.py`: relaxation, harmonic displacements, forces, and bands
+- `phono3py_stages.py`: third-order displacements, forces, IFCs, and conductivity
+- `stage_archive.py`: band, DOS, and conductivity plot archives
+- `stage_common.py`: stage paths, input propagation, and shared file helpers
+- `phono3py_utils.py`: displacement manifests and resumable force checkpoints
