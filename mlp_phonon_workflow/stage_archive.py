@@ -102,6 +102,7 @@ def plot_dos_archive(
     frequency_min: float | None = None,
     frequency_max: float | None = None,
     frequency_pitch: float | None = None,
+    projected: bool | None = None,
     dpi: int | None = None,
 ) -> dict[str, Any]:
     from .dos_plot import mesh_tag, plot_dos_from_fc2
@@ -116,6 +117,7 @@ def plot_dos_archive(
         "frequency_min": frequency_min,
         "frequency_max": frequency_max,
         "frequency_pitch": frequency_pitch,
+        "projected": projected,
         "dpi": dpi,
     }
     dos_settings = {
@@ -162,6 +164,7 @@ def plot_dos_archive(
         frequency_pitch=dos_settings.get("frequency_pitch"),
         is_gamma_center=bool(dos_settings.get("is_gamma_center", True)),
         is_mesh_symmetry=bool(dos_settings.get("is_mesh_symmetry", True)),
+        projected=bool(dos_settings.get("projected", False)),
         symprec=float(ph3_config.get("symprec", 1.0e-5)),
         dpi=int(dos_settings.get("dpi", 200)),
     )

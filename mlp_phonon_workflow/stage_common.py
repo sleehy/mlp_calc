@@ -289,8 +289,8 @@ def _clear_matching_ph3_displace_input(
         ph3_poscar.unlink()
 
 
-def _max_force(atoms: Any) -> float:
-    forces = atoms.get_forces()
+def _max_force(atoms: Any, *, apply_constraint: bool = True) -> float:
+    forces = atoms.get_forces(apply_constraint=apply_constraint)
     if len(forces) == 0:
         return 0.0
     return max(

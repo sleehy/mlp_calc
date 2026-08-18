@@ -1,9 +1,10 @@
 # MLP phonopy and phono3py workflow
 
-This repository contains two resumable workflows that share the same fixed-cell
-atomic relaxation:
+This repository contains two resumable workflows that share the same atomic
+relaxation:
 
-1. read `POSCAR` and relax atomic positions with a fixed cell using an MLP
+1. read `POSCAR` and relax atomic positions, optionally together with the cell,
+   using an MLP
 2. generate phonopy displacement supercells
 3. evaluate displaced-supercell forces with the same MLP and write `FORCE_SETS`
 4. build force constants with phonopy and write `band.yaml`
@@ -29,6 +30,7 @@ Edit `config.toml`, especially:
 - `workflow.active_mlp`
 - `workflow.input_poscar`
 - MLP `kwargs` such as `device`, `model`, or local checkpoint paths
+- `relax.cell.enabled` and `relax.cell.mask` for cell relaxation
 - `phonopy.supercell_matrix`
 - `displacements.distance`
 - `band.auto`, `band.nqpoints`, `band.paths`, and `band.labels`
@@ -48,6 +50,114 @@ python -m mlp_phonon_workflow run displace -c config.toml
 python -m mlp_phonon_workflow run forces -c config.toml
 python -m mlp_phonon_workflow run band -c config.toml
 ```
+
+Plot the archived `band.yaml` as a calculated dispersion relation without
+experimental data:
+
+```bash
+python -m mlp_phonon_workflow plot-band \
+  -c config.toml \
+  --mode dispersion
+```
+
+To overlay a two-column experimental CSV, select `experiment` mode. When the
+digitized x axis uses custom high-symmetry-point positions, give one position
+for the path start and every segment end:
+
+```bash
+python -m mlp_phonon_workflow plot-band \
+  -c config.toml \
+  --mode experiment \
+  --experiment-csv experiment_points.csv \
+  --high-symmetry-positions 0 0.3048762 0.4124713 0.736312 1
+```
+
+Without `--high-symmetry-positions`, calculated cumulative band distances are
+normalized to 0--1. Use `--band-yaml` for a non-archived input and `--output`
+to select the PNG path. Imaginary modes remain at their negative signed
+frequencies in both modes. The existing `run all` command is unchanged and
+does not select a plotting mode.
+
+Override the configured run directory for one command with `--run-dir`. The
+override is retained when the command automatically relaunches into an MLP
+conda environment:
+
+```bash
+python -m mlp_phonon_workflow run relax \
+  -c config.toml \
+  --poscar mlp_phonon_workflow/POSCAR_FA_100 \
+  --run-dir runs/sevennet/cubic/FA_100
+```
+
+### Atomic and cell relaxation
+
+The relax stage always optimizes the atomic degrees of freedom allowed by the
+workflow constraints. Any `Selective dynamics` flags inherited from the source
+POSCAR are removed from the copied `01_relax/INPUT/POSCAR` before the
+code-defined fixed-atom and fixed-bond constraints are applied. The original
+source POSCAR is not modified. Cell relaxation is optional:
+
+```toml
+[relax]
+optimizer = "BFGS"
+fmax = 0.001
+max_steps = 500
+maxstep = 0.2  # maximum optimizer displacement per iteration in angstrom
+write_extxyz = true
+
+[relax.cell]
+enabled = true
+filter = "frechet"  # recommended; "unit" is also available
+mask = [true, true, true, true, true, true]  # xx, yy, zz, yz, xz, xy
+hydrostatic_strain = false
+constant_volume = false
+scalar_pressure_gpa = 0.0
+
+[relax.symmetry]
+enabled = true
+symprec = 1.0e-3
+adjust_positions = true
+adjust_cell = true
+verbose = false
+
+[relax.n_h_bond_restraint]
+enabled = false
+cutoff = 1.25  # angstrom
+spring_constant = 50.0  # eV/angstrom^2
+```
+
+With `enabled = false`, the cell is fixed and only atomic positions are
+relaxed. With `enabled = true`, the selected MLP must provide stress. The
+Frechet cell filter minimizes atomic and cell degrees of freedom together;
+`fmax` is applied to their combined generalized forces. Set
+`hydrostatic_strain = true` to allow only isotropic volume changes, or use
+`mask` to select individual strain components. A positive
+`scalar_pressure_gpa` applies compressive external pressure.
+The `maxstep` setting limits the optimizer displacement in one iteration and
+defaults to ASE's standard value of 0.2 angstrom.
+
+When `relax.symmetry.enabled = true`, ASE `FixSymmetry` symmetrizes atomic
+forces, stress, atomic steps, and cell-deformation steps throughout the
+optimization. For example, a `P4bm` tetragonal input retains `a=b` during cell
+relaxation. `symprec` controls the symmetry detected from the input structure.
+If the input is already detected as `P1`, the workflow prints a warning because
+there is no non-trivial symmetry to preserve. Start from the symmetric
+structure rather than from an already symmetry-broken relaxation when the
+crystal phase must remain fixed.
+
+Set `relax.n_h_bond_restraint.enabled = true` to apply
+`0.5 * k * (r - r0)^2` to every initial N-H bond found within `cutoff`,
+including bonds crossing a periodic boundary. Here `r0` is each initial bond
+length and `spring_constant` is `k` in eV/angstrom^2. The restraint contributes
+energy, forces, and virial stress, so it can also be used during cell
+relaxation. The detected zero-based atom-index pairs and target lengths are
+recorded in `metadata.json`. Enabling the option without a matching N-H pair
+raises an error so that an unsuitable cutoff does not silently run
+unrestrained.
+
+The output `metadata.json` records the initial and final cells and volumes,
+the constrained and unconstrained maximum atomic forces, and the final stress
+and pressure when cell relaxation is enabled.
 
 Or run the whole chain:
 
@@ -143,6 +253,140 @@ python -m mlp_phonon_workflow plot-dos --mlp mace_mp  --mesh 40 40 40
 python -m mlp_phonon_workflow plot-dos --mlp sevennet --mesh 40 40 40
 ```
 
+Set `dos.projected = true` or pass `--projected` to additionally calculate
+element-projected phonon DOS. The total DOS remains in `phonon_dos.*`; the
+projected result is written separately as `phonon_projected_dos.png` and
+`phonon_projected_dos.csv`:
+
+```bash
+python -m mlp_phonon_workflow plot-dos \
+  --mlp sevennet \
+  --mesh 40 40 40 \
+  --projected
+```
+
+The projected CSV contains the total DOS and one column per element in the
+primitive cell. Phonopy requires eigenvectors on the full q-point mesh for
+projected DOS, so mesh symmetry is automatically disabled for this calculation.
+This uses more memory and time than total DOS. Use `--no-projected` to override
+an enabled config for a single command.
+When multiple MLPs are selected, each MLP gets its own projected-DOS files;
+the shared comparison figure continues to overlay total DOS curves only.
+
+To calculate total and projected DOS directly from the harmonic phonopy stage,
+pass its `phonopy_params.yaml`. This file contains the displacement-force
+dataset, so the workflow reconstructs the harmonic force constants without
+using phono3py:
+
+```bash
+python -m mlp_phonon_workflow plot-dos \
+  -c config.toml \
+  --mlp sevennet \
+  --phonopy-yaml runs/sevennet/cubic/FA_100/04_band/OUTPUT/phonopy_params.yaml \
+  --mesh 40 40 40 \
+  --projected
+```
+
+By default, this writes to
+`<phonopy-yaml-directory>/dos/mesh-NxNxN/`. Use `--output-dir` to select an
+exact output directory. If the YAML does not contain forces, provide an
+existing `FORCE_CONSTANTS` or `force_constants.hdf5` with
+`--force-constants`; an optional NAC file can be supplied with `--born`.
+`band.yaml` alone is not a valid DOS input because it only contains the
+one-dimensional band path.
+
+To draw the harmonic band structure and element-projected DOS side by side,
+use `plot-band-dos`:
+
+```bash
+python -m mlp_phonon_workflow plot-band-dos \
+  -c config.toml \
+  --mlp sevennet \
+  --phonopy-yaml runs/sevennet/cubic/FA_100/04_band/OUTPUT/phonopy_params.yaml \
+  --mesh 40 40 40
+```
+
+This command uses Phonopy's built-in
+`phonon.plot_band_structure_and_dos(pdos_indices=...)`. Primitive-cell atoms
+are grouped by element and passed as zero-based PDOS index groups. The band
+path comes from the `[band]` config (`auto`, `nqpoints`, `paths`, and
+`labels`), while the mesh and integration defaults come from `[dos]`.
+The default outputs beside the input YAML are
+`phonon_band_projected_dos.png` and `phonon_band_projected_dos.json`.
+Use `--output` to select another PNG path; the metadata JSON is written with
+the same basename.
+
+To customize the Matplotlib Figure while keeping the CLI workflow, write a
+Python file that defines `customize(fig)`:
+
+```python
+# customize_band_pdos.py
+def customize(fig):
+    band_axes = [
+        axis for axis in fig.axes
+        if (axis.get_gid() or "").startswith("band_")
+    ]
+    pdos_axis = next(
+        axis for axis in fig.axes
+        if axis.get_gid() == "projected_dos"
+    )
+
+    for axis in [*band_axes, pdos_axis]:
+        axis.set_ylim(-5, 20)
+    band_axes[0].set_ylabel("Phonon frequency (THz)")
+    pdos_axis.set_xlabel("Element-projected DOS")
+    fig.suptitle("Customized band structure and PDOS")
+```
+
+Pass that file to the workflow:
+
+```bash
+python -m mlp_phonon_workflow plot-band-dos \
+  -c config.toml \
+  --phonopy-yaml runs/sevennet/cubic/FA_100/04_band/OUTPUT/phonopy_params.yaml \
+  --mesh 40 40 40 \
+  --customizer customize_band_pdos.py
+```
+
+For full Matplotlib control from another Python file, use the Figure-returning
+API. It performs the Phonopy calculations and built-in combined plotting but
+does not save or close the figure:
+
+```python
+import matplotlib.pyplot as plt
+
+from mlp_phonon_workflow.dos_plot import (
+    plot_band_with_projected_dos_from_phonopy,
+)
+
+figure = plot_band_with_projected_dos_from_phonopy(
+    "runs/sevennet/cubic/FA_100/04_band/OUTPUT/phonopy_params.yaml",
+    mesh=[40, 40, 40],
+)
+
+band_axes = [
+    axis for axis in figure.axes
+    if (axis.get_gid() or "").startswith("band_")
+]
+pdos_axis = next(
+    axis for axis in figure.axes
+    if axis.get_gid() == "projected_dos"
+)
+
+for axis in [*band_axes, pdos_axis]:
+    axis.set_ylim(-5, 20)
+band_axes[0].set_ylabel("Phonon frequency (THz)")
+pdos_axis.set_xlabel("Element-projected DOS")
+figure.suptitle("Customized band structure and PDOS")
+
+figure.savefig("custom_band_pdos.png", dpi=300, bbox_inches="tight")
+plt.close(figure)
+```
+
+The returned object is a `matplotlib.figure.Figure`. Populated band axes have
+IDs `band_0`, `band_1`, and so on, while the PDOS axis has ID
+`projected_dos`, making them easy to select without relying on axes order.
+
 To calculate the same independent mesh for several MLPs and overlay their DOS
 curves in one figure, list all MLPs after a single `--mlp` option:
 
@@ -169,6 +413,7 @@ mesh = [40, 40, 40]
 method = "tetrahedron"
 is_gamma_center = true
 is_mesh_symmetry = true
+projected = true
 dpi = 200
 ```
 
@@ -190,7 +435,8 @@ plot_archive/{mlp}/
     inputs/{phono3py_params.yaml,fc2.hdf5}
     mesh-NxNxN/
       inputs/{phono3py_params.yaml,fc2.hdf5}
-      {phonon_dos.png,phonon_dos.csv,metadata.json}
+      {phonon_dos.png,phonon_dos.csv}
+      {phonon_projected_dos.png,phonon_projected_dos.csv,metadata.json}
   thermal_conductivity/
     rta/
       inputs/kappa-*.hdf5
@@ -276,9 +522,11 @@ the workflow's `forces_fc3.npy`/`forces_fc2.npy` files or standard phono3py
 `phono3py_disp.yaml`, `fc2.hdf5`, and `fc3.hdf5`; an optional `BORN` file in the
 same directory enables NAC through phono3py.
 
-The relax stage checks force convergence only. If it does not converge within
-`relax.max_steps`, `01_relax/OUTPUT/POSCAR` is not written, so the displacement
-stage cannot be populated from a failed relaxation.
+The fixed-cell relax stage checks atomic force convergence. With cell
+relaxation enabled, convergence includes the generalized cell forces from the
+selected cell filter. If it does not converge within `relax.max_steps`,
+`01_relax/OUTPUT/POSCAR` is not written, so the displacement stage cannot be
+populated from a failed relaxation.
 
 By default, generated files are copied into the next stage's `INPUT/` only when that
 file is missing. Set `workflow.overwrite_next_inputs = true` if you want prior stages

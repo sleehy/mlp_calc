@@ -14,6 +14,346 @@ MFP_UNITS = {
 }
 
 
+def plot_band_dispersion(
+    band_yaml_file: str | Path,
+    *,
+    output_file: str | Path | None = None,
+    dpi: int = 200,
+) -> dict[str, Any]:
+    """Plot a phonopy band.yaml without experimental data."""
+    band_data = _read_band_yaml(band_yaml_file)
+    destination = _band_plot_destination(
+        band_data["source"],
+        output_file,
+        default_name="phonon_band.png",
+    )
+    _draw_band_plot(
+        band_data,
+        destination,
+        dpi=dpi,
+    )
+    return _band_plot_result(
+        band_data,
+        destination,
+        mode="dispersion",
+    )
+
+
+def plot_band_with_experiment(
+    band_yaml_file: str | Path,
+    experiment_csv_file: str | Path,
+    *,
+    output_file: str | Path | None = None,
+    high_symmetry_positions: Sequence[float] | None = None,
+    dpi: int = 200,
+) -> dict[str, Any]:
+    """Overlay experimental points on a phonopy dispersion relation.
+
+    Experimental x coordinates are assumed to span 0--1 unless explicit
+    high-symmetry positions are supplied.
+    """
+    import numpy as np
+
+    band_data = _read_band_yaml(band_yaml_file)
+    experiment_source = Path(experiment_csv_file).expanduser().resolve()
+    experiment = _read_experiment_csv(experiment_source)
+    positions = (
+        np.asarray(high_symmetry_positions, dtype=float)
+        if high_symmetry_positions is not None
+        else _normalised_band_boundaries(band_data)
+    )
+    expected = len(band_data["segments"]) + 1
+    if positions.shape != (expected,):
+        raise ValueError(
+            "high_symmetry_positions must contain one value for the first "
+            f"point and one for each segment end ({expected} values required)."
+        )
+    if not np.all(np.isfinite(positions)) or np.any(np.diff(positions) < 0):
+        raise ValueError(
+            "high_symmetry_positions must be finite and monotonically increasing."
+        )
+
+    destination = _band_plot_destination(
+        band_data["source"],
+        output_file,
+        default_name="phonon_band_with_experiment.png",
+    )
+    _draw_band_plot(
+        band_data,
+        destination,
+        dpi=dpi,
+        experiment=experiment,
+        plot_boundaries=positions,
+    )
+    result = _band_plot_result(
+        band_data,
+        destination,
+        mode="experiment",
+    )
+    result.update(
+        {
+            "experiment": str(experiment_source),
+            "experiment_points": int(len(experiment)),
+            "high_symmetry_positions": positions.tolist(),
+        }
+    )
+    return result
+
+
+def _read_band_yaml(band_yaml_file: str | Path) -> dict[str, Any]:
+    import numpy as np
+    import yaml
+
+    source = Path(band_yaml_file).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Band YAML file not found: {source}")
+    with source.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+
+    phonons = raw.get("phonon")
+    if not isinstance(phonons, list) or not phonons:
+        raise ValueError(f"No phonon points were found in {source}.")
+    try:
+        distances = np.asarray([point["distance"] for point in phonons], dtype=float)
+        frequencies = np.asarray(
+            [
+                [band["frequency"] for band in point["band"]]
+                for point in phonons
+            ],
+            dtype=float,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid phonopy band data in {source}.") from exc
+    if frequencies.ndim != 2 or frequencies.shape[0] != len(distances):
+        raise ValueError(f"Inconsistent band dimensions in {source}.")
+    if not np.all(np.isfinite(distances)) or not np.all(np.isfinite(frequencies)):
+        raise ValueError(f"Non-finite band data found in {source}.")
+
+    segments = _band_segments(raw, distances)
+    labels = _band_boundary_labels(raw.get("labels"), len(segments))
+    return {
+        "source": source,
+        "distances": distances,
+        "frequencies": frequencies,
+        "segments": segments,
+        "labels": labels,
+    }
+
+
+def _band_segments(raw: dict[str, Any], distances):
+    import numpy as np
+
+    segment_nqpoint = raw.get("segment_nqpoint")
+    if isinstance(segment_nqpoint, list):
+        counts = [int(value) for value in segment_nqpoint]
+        if counts and all(value >= 2 for value in counts) and sum(counts) == len(
+            distances
+        ):
+            segments = []
+            start = 0
+            for count in counts:
+                stop = start + count
+                segments.append(np.arange(start, stop, dtype=int))
+                start = stop
+            return segments
+
+    breaks = np.flatnonzero(np.isclose(np.diff(distances), 0.0, atol=1.0e-12)) + 1
+    segments = [
+        segment
+        for segment in np.split(np.arange(len(distances), dtype=int), breaks)
+        if len(segment) >= 2
+    ]
+    if not segments:
+        raise ValueError("Could not determine band-path segments.")
+    return segments
+
+
+def _band_boundary_labels(raw_labels: Any, segment_count: int) -> list[str]:
+    if (
+        isinstance(raw_labels, list)
+        and len(raw_labels) == segment_count
+        and all(
+            isinstance(pair, (list, tuple)) and len(pair) == 2
+            for pair in raw_labels
+        )
+    ):
+        labels = [str(raw_labels[0][0])]
+        for index, pair in enumerate(raw_labels):
+            right = str(pair[1])
+            if index + 1 < segment_count:
+                next_left = str(raw_labels[index + 1][0])
+                if _plain_band_label(right) != _plain_band_label(next_left):
+                    right = f"{right}|{next_left}"
+            labels.append(right)
+        return labels
+    if isinstance(raw_labels, list) and len(raw_labels) == segment_count + 1:
+        return [str(label) for label in raw_labels]
+    return [""] * (segment_count + 1)
+
+
+def _plain_band_label(label: str) -> str:
+    label = label.strip().strip("$")
+    if label.upper() in {"G", "GAMMA", r"\GAMMA"} or label == "Γ":
+        return "GAMMA"
+    return label
+
+
+def _display_band_label(label: str) -> str:
+    if "|" in label:
+        return "|".join(_display_band_label(part) for part in label.split("|"))
+    return r"$\Gamma$" if _plain_band_label(label) == "GAMMA" else label
+
+
+def _normalised_band_boundaries(band_data: dict[str, Any]):
+    import numpy as np
+
+    boundaries = _native_band_boundaries(band_data)
+    lower = float(boundaries[0])
+    span = float(boundaries[-1] - lower)
+    if span <= 0:
+        return np.linspace(0.0, 1.0, len(boundaries))
+    return (boundaries - lower) / span
+
+
+def _native_band_boundaries(band_data: dict[str, Any]):
+    import numpy as np
+
+    distances = band_data["distances"]
+    segments = band_data["segments"]
+    return np.asarray(
+        [distances[segments[0][0]]]
+        + [distances[segment[-1]] for segment in segments],
+        dtype=float,
+    )
+
+
+def _read_experiment_csv(source: Path):
+    import numpy as np
+
+    if not source.exists():
+        raise FileNotFoundError(f"Experimental CSV file not found: {source}")
+    points = []
+    with source.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.reader(handle):
+            if len(row) < 2:
+                continue
+            try:
+                point = (float(row[0]), float(row[1]))
+            except ValueError:
+                continue
+            if np.all(np.isfinite(point)):
+                points.append(point)
+    if not points:
+        raise ValueError(f"No numeric x,y experimental points found in {source}.")
+    return np.asarray(points, dtype=float)
+
+
+def _band_plot_destination(
+    source: Path,
+    output_file: str | Path | None,
+    *,
+    default_name: str,
+) -> Path:
+    if output_file is None:
+        output = (
+            source.parent.parent / "plots" / default_name
+            if source.parent.name == "inputs"
+            else source.parent / "plots" / default_name
+        )
+    else:
+        output = Path(output_file).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+def _draw_band_plot(
+    band_data: dict[str, Any],
+    output: Path,
+    *,
+    dpi: int,
+    experiment=None,
+    plot_boundaries=None,
+) -> None:
+    import matplotlib
+    import numpy as np
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if dpi <= 0:
+        raise ValueError("dpi must be positive.")
+    native_boundaries = _native_band_boundaries(band_data)
+    boundaries = (
+        native_boundaries
+        if plot_boundaries is None
+        else np.asarray(plot_boundaries, dtype=float)
+    )
+    distances = band_data["distances"]
+    frequencies = band_data["frequencies"]
+
+    fig, ax = plt.subplots(figsize=(8.4, 5.8), constrained_layout=True)
+    for segment_index, segment in enumerate(band_data["segments"]):
+        native_left = native_boundaries[segment_index]
+        native_right = native_boundaries[segment_index + 1]
+        plot_left = boundaries[segment_index]
+        plot_right = boundaries[segment_index + 1]
+        if np.isclose(native_left, native_right):
+            x_values = np.linspace(plot_left, plot_right, len(segment))
+        else:
+            fraction = (distances[segment] - native_left) / (
+                native_right - native_left
+            )
+            x_values = plot_left + fraction * (plot_right - plot_left)
+        for band_index in range(frequencies.shape[1]):
+            ax.plot(
+                x_values,
+                frequencies[segment, band_index],
+                linewidth=1,
+                color="black",
+            )
+
+    if experiment is not None:
+        ax.scatter(
+            experiment[:, 0],
+            experiment[:, 1],
+            s=25,
+            marker="o",
+            label="Experiment",
+            zorder=3,
+        )
+        ax.legend(frameon=False)
+    for position in boundaries:
+        ax.axvline(position, linewidth=0.6, linestyle="--", color="black")
+    ax.axhline(0.0, linewidth=0.7, color="0.35")
+    ax.set_xticks(
+        boundaries,
+        [_display_band_label(label) for label in band_data["labels"]],
+    )
+    ax.set_xlabel("Wave vector")
+    ax.set_ylabel("Frequency (THz)")
+    ax.set_xlim(float(boundaries[0]), float(boundaries[-1]))
+    fig.savefig(output, dpi=dpi)
+    plt.close(fig)
+
+
+def _band_plot_result(
+    band_data: dict[str, Any],
+    output: Path,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    frequencies = band_data["frequencies"]
+    return {
+        "source": str(band_data["source"]),
+        "plot": str(output),
+        "mode": mode,
+        "nqpoint": int(len(band_data["distances"])),
+        "nband": int(frequencies.shape[1]),
+        "minimum_frequency_thz": float(frequencies.min()),
+        "imaginary_frequencies_plotted_as_negative": True,
+    }
+
+
 def kappa_plot_kwargs(
     plot_config: dict[str, Any],
     *,

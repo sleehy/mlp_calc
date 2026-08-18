@@ -1,7 +1,7 @@
 [workflow]
-active_mlp = "mattersim"          # mattersim, mace_mp, or sevennet
-run_dir = "runs/{mlp}"
-input_poscar = "POSCAR"
+active_mlp = "sevennet"           # mattersim, mace_mp, or sevennet
+run_dir = "runs/sevennet/orthohrombic"
+input_poscar = "runs/sevennet/orthohrombic/01_relax/INPUT/POSCAR"
 overwrite_next_inputs = true     # refresh downstream INPUT files from prior outputs
 
 [execution]
@@ -9,7 +9,7 @@ auto_relaunch = true              # relaunch each stage into the configured cond
 phonopy_conda_env = ""            # empty means use the selected MLP env
 
 [execution.extra_env]
-MPLCONFIGDIR = "{run_dir}/.matplotlib"
+MPLCONFIGDIR = "/tmp/mlp_phonon_matplotlib"
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
 
 [plot_archive]
@@ -27,6 +27,7 @@ method = "tetrahedron"            # tetrahedron or gaussian
 # frequency_pitch = 0.02          # THz; optional
 is_gamma_center = true
 is_mesh_symmetry = true
+projected = true                  # element-projected DOS; requires the full q mesh
 dpi = 200
 
 [mlp.mattersim]
@@ -54,18 +55,39 @@ calculator = "sevennet"
 conda_env = "sevenn_env"
 
 [mlp.sevennet.kwargs]
-model = "/home/eoung/mlp_calc/best.pth"
+model = "/home/eoung/mlp_calc/checkpoint_fine_tuned.pth"
 device = "auto"
 
 [relax]
 optimizer = "BFGS"               # LBFGS, BFGS, or FIRE
 fmax = 0.001
-max_steps = 500
+max_steps = 20000
+maxstep = 0.02                   # maximum optimizer displacement per iteration (angstrom)
 write_extxyz = true
+
+[relax.cell]
+enabled = true
+filter = "frechet"                # frechet (recommended) or unit
+mask = [true, true, true, false, false, false]  # xx, yy, zz, yz, xz, xy
+hydrostatic_strain = false      # true: allow only isotropic volume changes
+constant_volume = false
+scalar_pressure_gpa = 0.0         # positive values apply compressive pressure
+
+[relax.symmetry]
+enabled = false                    # preserve the input space-group symmetry
+symprec = 1.0e-3                  # symmetry detection tolerance (angstrom)
+adjust_positions = true
+adjust_cell = true
+verbose = false
+
+[relax.n_h_bond_restraint]
+enabled = false                   # true: apply harmonic N-H bond restraints
+cutoff = 1.25                    # N-H bond detection cutoff (angstrom)
+spring_constant = 50.0           # eV/angstrom^2
 
 [phonopy]
 calculator = "vasp"
-supercell_matrix = [2, 2, 2]
+supercell_matrix = [3, 3, 3]
 primitive_matrix = "auto"
 symprec = 1.0e-5
 is_symmetry = true
@@ -84,23 +106,18 @@ subtract_drift = true
 write_npz = true
 
 [band]
-auto = false                       # true: use phonopy auto band path
+auto = true
 nqpoints = 101
 with_eigenvectors = false
 with_group_velocities = false
 is_band_connection = false
-fc_calculator = "traditional"     # traditional, symfc, or alm if installed
+fc_calculator = "traditional"
 fc_calculator_options = ""
 write_force_constants = false
-force_constants_format = "hdf5"   # hdf5 or text
-paths = [
-    [[0.0,   0.0,   0.0],   [0.5,   0.0,   0.5]],   # G -> X
-    [[0.5,   0.0,   0.5],   [0.375, 0.375, 0.75]],  # X -> K
-    [[0.375, 0.375, 0.75],  [0.0,   0.0,   0.0]],   # K -> G
-    [[0.0,   0.0,   0.0],   [0.5,   0.5,   0.5]],   # G -> L
-]
+force_constants_format = "hdf5"
 
-labels = ["G", "X", "K", "G", "L"]
+paths = []
+labels = []
 
 # Third-order workflow. This is independent of the phonopy sections above.
 [phono3py]

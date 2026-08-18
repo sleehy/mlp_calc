@@ -44,43 +44,140 @@ def _run_relax(config: dict[str, Any], *, force: bool) -> None:
         _clear_relax_success_outputs(paths)
 
     from ase.io import read, write
+    from ase.io.trajectory import Trajectory
     from ase.optimize import BFGS, FIRE, LBFGS
 
-    atoms = read(in_poscar, format="vasp")
-    atoms.calc = build_calculator(config)
-
     relax_config = config["relax"]
+    cell_config = relax_config.get("cell", {})
+    relax_cell = bool(cell_config.get("enabled", False))
+    atoms = read(in_poscar, format="vasp")
+
+    # Ignore Selective dynamics inherited from the source POSCAR.  Constraints
+    # used by this relaxation are defined below instead.
+    removed_input_constraints = len(atoms.constraints)
+    atoms.set_constraint()
+    write(in_poscar, atoms, format="vasp", direct=True, vasp5=True)
+    if removed_input_constraints:
+        print(
+            "[relax] removed Selective dynamics constraints from copied POSCAR "
+            f"({removed_input_constraints} ASE constraints)"
+        )
+
+    symmetry_metadata = _apply_symmetry_constraint(
+        atoms,
+        relax_config.get("symmetry", {}),
+    )
+
+    # Add the chemical symbols whose positions should remain fixed during
+    # relaxation.  For example: {"Pb", "I"}.  Leave empty to fix none.
+    fixed_atom_types: set[str] = set()
+    fixed_atom_indices = [
+        atom.index for atom in atoms if atom.symbol in fixed_atom_types
+    ]
+    missing_atom_types = fixed_atom_types.difference(atoms.get_chemical_symbols())
+    if missing_atom_types:
+        raise ValueError(
+            "Cannot fix atom types that are not present in the input POSCAR: "
+            + ", ".join(sorted(missing_atom_types))
+        )
+    if fixed_atom_indices:
+        from ase.constraints import FixAtoms
+
+        atoms.set_constraint(
+            [*atoms.constraints, FixAtoms(indices=fixed_atom_indices)]
+        )
+        print(
+            "[relax] fixed atom positions: "
+            f"{', '.join(sorted(fixed_atom_types))} "
+            f"({len(fixed_atom_indices)} atoms)"
+        )
+
+    atoms.calc = build_calculator(config)
+    n_h_bond_metadata = _apply_n_h_bond_restraint(
+        atoms,
+        relax_config.get("n_h_bond_restraint", {}),
+    )
+
+    initial_cell = atoms.cell.array.copy()
+    initial_volume = float(atoms.get_volume())
+    optimization_target = _relaxation_target(atoms, cell_config)
+
     optimizer_name = str(relax_config.get("optimizer", "LBFGS")).upper()
     optimizers = {"LBFGS": LBFGS, "BFGS": BFGS, "FIRE": FIRE}
     if optimizer_name not in optimizers:
         raise ValueError(f"Unknown relax.optimizer: {optimizer_name}")
 
-    trajectory = str(paths.output / "relax.traj")
+    trajectory_path = paths.output / "relax.traj"
     logfile = str(paths.output / "relax.log")
-    optimizer = optimizers[optimizer_name](atoms, trajectory=trajectory, logfile=logfile)
-    converged = bool(
-        optimizer.run(
-            fmax=float(relax_config.get("fmax", 0.01)),
-            steps=int(relax_config.get("max_steps", 500)),
+    maxstep = float(relax_config.get("maxstep", 0.2))
+    if relax_cell:
+        trajectory = Trajectory(trajectory_path, "w", atoms)
+        optimizer = optimizers[optimizer_name](
+            optimization_target,
+            logfile=logfile,
+            maxstep=maxstep,
         )
-    )
+        optimizer.attach(trajectory.write)
+    else:
+        trajectory = None
+        optimizer = optimizers[optimizer_name](
+            optimization_target,
+            trajectory=str(trajectory_path),
+            logfile=logfile,
+            maxstep=maxstep,
+        )
+
+    try:
+        converged = bool(
+            optimizer.run(
+                fmax=float(relax_config.get("fmax", 0.01)),
+                steps=int(relax_config.get("max_steps", 500)),
+            )
+        )
+    finally:
+        if trajectory is not None:
+            trajectory.close()
 
     metadata = {
         "stage": "relax",
         "input": str(in_poscar),
         "output": str(out_poscar),
         "converged": converged,
-        "cell_fixed": True,
+        "cell_fixed": not relax_cell,
+        "cell_filter": (
+            str(cell_config.get("filter", "frechet")).lower()
+            if relax_cell
+            else None
+        ),
+        "initial_cell_angstrom": initial_cell.tolist(),
+        "final_cell_angstrom": atoms.cell.array.tolist(),
+        "initial_volume_angstrom3": initial_volume,
+        "final_volume_angstrom3": float(atoms.get_volume()),
         "max_force_ev_per_a": _safe_float(lambda: _max_force(atoms)),
+        "max_unconstrained_force_ev_per_a": _safe_float(
+            lambda: _max_force(atoms, apply_constraint=False)
+        ),
         "potential_energy_ev": _safe_float(lambda: atoms.get_potential_energy()),
+        "symmetry": symmetry_metadata,
+        "removed_input_constraints": removed_input_constraints,
+        "fixed_atom_types": sorted(fixed_atom_types),
+        "fixed_atom_indices": fixed_atom_indices,
+        "n_h_bond_restraint": n_h_bond_metadata,
     }
+    if symmetry_metadata["enabled"]:
+        symmetry_metadata["final"] = _symmetry_summary(
+            atoms,
+            float(symmetry_metadata["symprec"]),
+        )
+    if relax_cell:
+        metadata.update(_stress_metadata(atoms))
 
     if not converged:
         _clear_relax_success_outputs(paths)
         metadata["output"] = None
         _write_json(paths.output / "metadata.json", metadata)
         raise RuntimeError(
-            "Atomic-position relaxation did not reach force convergence within "
+            "Relaxation did not reach force/cell convergence within "
             f"{relax_config.get('max_steps')} steps. No relaxed POSCAR was written."
         )
 
@@ -92,6 +189,163 @@ def _run_relax(config: dict[str, Any], *, force: bool) -> None:
     _write_json(paths.output / "metadata.json", metadata)
     _populate_displace_input(config)
     _populate_ph3_displace_input(config)
+
+
+def _apply_n_h_bond_restraint(
+    atoms: Any,
+    bond_config: dict[str, Any],
+) -> dict[str, Any]:
+    enabled = bool(bond_config.get("enabled", False))
+    cutoff = float(bond_config.get("cutoff", 1.25))
+    spring_constant = float(bond_config.get("spring_constant", 50.0))
+    metadata: dict[str, Any] = {
+        "enabled": enabled,
+        "cutoff_angstrom": cutoff,
+        "spring_constant_ev_per_angstrom2": spring_constant,
+        "pairs": [],
+        "target_lengths_angstrom": [],
+    }
+    if not enabled:
+        return metadata
+
+    nitrogen_indices = [
+        atom.index for atom in atoms if atom.symbol == "N"
+    ]
+    hydrogen_indices = [
+        atom.index for atom in atoms if atom.symbol == "H"
+    ]
+    pairs: list[tuple[int, int]] = []
+    lengths: list[float] = []
+    for nitrogen_index in nitrogen_indices:
+        for hydrogen_index in hydrogen_indices:
+            distance = float(
+                atoms.get_distance(nitrogen_index, hydrogen_index, mic=True)
+            )
+            if distance <= cutoff:
+                pairs.append((nitrogen_index, hydrogen_index))
+                lengths.append(distance)
+
+    if not pairs:
+        raise ValueError(
+            "relax.n_h_bond_restraint is enabled, but no N-H pair was found "
+            f"within the {cutoff:g} A cutoff."
+        )
+
+    from ase.calculators.mixing import SumCalculator
+
+    from .harmonic_restraint import HarmonicBondRestraintCalculator
+
+    restraint_calculator = HarmonicBondRestraintCalculator(
+        pairs,
+        lengths,
+        spring_constant,
+    )
+    atoms.calc = SumCalculator([atoms.calc, restraint_calculator])
+    metadata["pairs"] = [list(pair) for pair in pairs]
+    metadata["target_lengths_angstrom"] = lengths
+    print(
+        f"[relax] harmonic N-H bond restraints: {len(pairs)} bonds "
+        f"(cutoff={cutoff:g} A, k={spring_constant:g} eV/A^2)"
+    )
+    return metadata
+
+
+def _apply_symmetry_constraint(
+    atoms: Any,
+    symmetry_config: dict[str, Any],
+) -> dict[str, Any]:
+    enabled = bool(symmetry_config.get("enabled", False))
+    symprec = float(symmetry_config.get("symprec", 1.0e-3))
+    metadata: dict[str, Any] = {
+        "enabled": enabled,
+        "symprec": symprec,
+        "adjust_positions": bool(
+            symmetry_config.get("adjust_positions", True)
+        ),
+        "adjust_cell": bool(symmetry_config.get("adjust_cell", True)),
+    }
+    if not enabled:
+        return metadata
+
+    from ase.constraints import FixSymmetry
+
+    metadata["before_refinement"] = _symmetry_summary(atoms, symprec)
+    existing_constraints = list(atoms.constraints)
+    symmetry_constraint = FixSymmetry(
+        atoms,
+        symprec=symprec,
+        adjust_positions=metadata["adjust_positions"],
+        adjust_cell=metadata["adjust_cell"],
+        verbose=bool(symmetry_config.get("verbose", False)),
+    )
+    atoms.set_constraint([*existing_constraints, symmetry_constraint])
+    metadata["initial"] = _symmetry_summary(atoms, symprec)
+
+    initial = metadata["initial"]
+    print(
+        f"[relax] preserve symmetry: {initial['international']} "
+        f"(No. {initial['number']}, symprec={symprec:g} A)"
+    )
+    if int(initial["number"]) == 1:
+        print(
+            "[relax] warning: FixSymmetry detected P1; there is no "
+            "non-trivial space-group symmetry to preserve."
+        )
+    return metadata
+
+
+def _symmetry_summary(atoms: Any, symprec: float) -> dict[str, Any]:
+    from ase.spacegroup.symmetrize import check_symmetry
+
+    dataset = check_symmetry(atoms, symprec=symprec, verbose=False)
+    return {
+        "international": str(dataset.international),
+        "number": int(dataset.number),
+        "hall": str(dataset.hall),
+    }
+
+
+def _relaxation_target(atoms: Any, cell_config: dict[str, Any]):
+    if not bool(cell_config.get("enabled", False)):
+        return atoms
+
+    from ase.calculators.calculator import PropertyNotImplementedError
+    from ase.filters import FrechetCellFilter, UnitCellFilter
+    from ase.units import GPa
+
+    try:
+        atoms.get_stress()
+    except PropertyNotImplementedError as exc:
+        raise RuntimeError(
+            "Cell relaxation requires stress, but the selected MLP calculator "
+            "does not provide it."
+        ) from exc
+
+    filter_name = str(cell_config.get("filter", "frechet")).lower()
+    filters = {
+        "frechet": FrechetCellFilter,
+        "unit": UnitCellFilter,
+    }
+    filter_class = filters[filter_name]
+    return filter_class(
+        atoms,
+        mask=list(cell_config.get("mask", [True] * 6)),
+        hydrostatic_strain=bool(cell_config.get("hydrostatic_strain", False)),
+        constant_volume=bool(cell_config.get("constant_volume", False)),
+        scalar_pressure=float(cell_config.get("scalar_pressure_gpa", 0.0)) * GPa,
+    )
+
+
+def _stress_metadata(atoms: Any) -> dict[str, Any]:
+    from ase.units import GPa
+
+    stress = atoms.get_stress(voigt=True) / GPa
+    pressure = -float(sum(stress[:3])) / 3.0
+    return {
+        "stress_gpa_voigt": [float(component) for component in stress],
+        "pressure_gpa": pressure,
+        "max_abs_stress_gpa": max(abs(float(component)) for component in stress),
+    }
 
 
 def _run_displace(config: dict[str, Any], *, force: bool) -> None:
@@ -353,4 +607,3 @@ def _run_band(config: dict[str, Any], *, force: bool) -> None:
             "archive_outputs": archive_outputs,
         },
     )
-

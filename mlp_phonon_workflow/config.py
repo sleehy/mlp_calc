@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "frequency_pitch": None,
         "is_gamma_center": True,
         "is_mesh_symmetry": True,
+        "projected": False,
         "dpi": 200,
     },
     "mlp": {
@@ -76,7 +77,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "optimizer": "LBFGS",
         "fmax": 0.01,
         "max_steps": 500,
+        "maxstep": 0.2,
         "write_extxyz": True,
+        "cell": {
+            "enabled": False,
+            "filter": "frechet",
+            "mask": [True, True, True, True, True, True],
+            "hydrostatic_strain": False,
+            "constant_volume": False,
+            "scalar_pressure_gpa": 0.0,
+        },
+        "symmetry": {
+            "enabled": False,
+            "symprec": 1.0e-3,
+            "adjust_positions": True,
+            "adjust_cell": True,
+            "verbose": False,
+        },
+        "n_h_bond_restraint": {
+            "enabled": False,
+            "cutoff": 1.25,
+            "spring_constant": 50.0,
+        },
     },
     "phonopy": {
         "calculator": "vasp",
@@ -219,6 +241,7 @@ def load_config(
     *,
     mlp_override: str | None = None,
     poscar_override: str | None = None,
+    run_dir_override: str | None = None,
 ) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     if not config_path.exists():
@@ -230,6 +253,8 @@ def load_config(
         config["workflow"]["active_mlp"] = mlp_override
     if poscar_override:
         config["workflow"]["input_poscar"] = poscar_override
+    if run_dir_override:
+        config["workflow"]["run_dir"] = run_dir_override
 
     config["_meta"] = {
         "config_path": config_path,
@@ -302,6 +327,82 @@ def validate_config(config: dict[str, Any]) -> None:
     if int(plot_config.get("bins", 200)) < 2:
         raise ConfigError("thermal_conductivity.plots.bins must be at least 2.")
 
+    relax_config = config.get("relax", {})
+    try:
+        relax_maxstep = float(relax_config.get("maxstep", 0.2))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("relax.maxstep must be a positive number.") from exc
+    if relax_maxstep <= 0.0:
+        raise ConfigError("relax.maxstep must be a positive number.")
+
+    cell_config = relax_config.get("cell", {})
+    cell_filter = str(cell_config.get("filter", "frechet")).lower()
+    if cell_filter not in {"frechet", "unit"}:
+        raise ConfigError("relax.cell.filter must be 'frechet' or 'unit'.")
+    cell_mask = cell_config.get("mask", [True] * 6)
+    if (
+        not isinstance(cell_mask, list)
+        or len(cell_mask) != 6
+        or any(not isinstance(component, bool) for component in cell_mask)
+    ):
+        raise ConfigError(
+            "relax.cell.mask must contain six booleans in "
+            "[xx, yy, zz, yz, xz, xy] order."
+        )
+    if bool(cell_config.get("constant_volume", False)) and bool(
+        cell_config.get("hydrostatic_strain", False)
+    ):
+        raise ConfigError(
+            "relax.cell.constant_volume and relax.cell.hydrostatic_strain "
+            "cannot both be true."
+        )
+    symmetry_config = relax_config.get("symmetry", {})
+    try:
+        symmetry_symprec = float(symmetry_config.get("symprec", 1.0e-3))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("relax.symmetry.symprec must be positive.") from exc
+    if symmetry_symprec <= 0:
+        raise ConfigError("relax.symmetry.symprec must be positive.")
+    symmetry_bool_defaults = {
+        "enabled": False,
+        "adjust_positions": True,
+        "adjust_cell": True,
+        "verbose": False,
+    }
+    for key, default in symmetry_bool_defaults.items():
+        if not isinstance(symmetry_config.get(key, default), bool):
+            raise ConfigError(f"relax.symmetry.{key} must be true or false.")
+
+    n_h_bond_config = relax_config.get("n_h_bond_restraint", {})
+    if not isinstance(n_h_bond_config.get("enabled", False), bool):
+        raise ConfigError(
+            "relax.n_h_bond_restraint.enabled must be true or false."
+        )
+    try:
+        n_h_bond_cutoff = float(n_h_bond_config.get("cutoff", 1.25))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "relax.n_h_bond_restraint.cutoff must be a positive number."
+        ) from exc
+    if n_h_bond_cutoff <= 0.0:
+        raise ConfigError(
+            "relax.n_h_bond_restraint.cutoff must be a positive number."
+        )
+    try:
+        n_h_bond_spring_constant = float(
+            n_h_bond_config.get("spring_constant", 50.0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "relax.n_h_bond_restraint.spring_constant must be "
+            "a positive number."
+        ) from exc
+    if n_h_bond_spring_constant <= 0.0:
+        raise ConfigError(
+            "relax.n_h_bond_restraint.spring_constant must be "
+            "a positive number."
+        )
+
     archive_config = config.get("plot_archive", {})
     if bool(archive_config.get("enabled", True)):
         archive_root = str(archive_config.get("root", "plot_archive")).strip()
@@ -324,6 +425,8 @@ def validate_config(config: dict[str, Any]) -> None:
         dos_sigma is None or float(dos_sigma) <= 0
     ):
         raise ConfigError("dos.sigma must be positive when dos.method='gaussian'.")
+    if not isinstance(dos_config.get("projected", False), bool):
+        raise ConfigError("dos.projected must be true or false.")
 
 
 def active_mlp(config: dict[str, Any]) -> str:
