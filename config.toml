@@ -1,7 +1,7 @@
 [workflow]
 active_mlp = "sevennet"           # mattersim, mace_mp, or sevennet
-run_dir = "runs/sevennet/orthohrombic"
-input_poscar = "runs/sevennet/orthohrombic/01_relax/INPUT/POSCAR"
+run_dir = "runs/sevennet/tetragonal"
+input_poscar = "runs/sevennet/tetragonal/01_relax/INPUT/POSCAR"
 overwrite_next_inputs = true     # refresh downstream INPUT files from prior outputs
 
 [execution]
@@ -74,11 +74,11 @@ constant_volume = false
 scalar_pressure_gpa = 0.0         # positive values apply compressive pressure
 
 [relax.symmetry]
-enabled = false                    # preserve the input space-group symmetry
+enabled = true                    # preserve the input space-group symmetry
 symprec = 1.0e-3                  # symmetry detection tolerance (angstrom)
 adjust_positions = true
 adjust_cell = true
-verbose = false
+verbose = true
 
 [relax.n_h_bond_restraint]
 enabled = false                   # true: apply harmonic N-H bond restraints
